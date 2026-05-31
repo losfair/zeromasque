@@ -18,6 +18,7 @@ use monoio::net::udp::UdpSocket;
 use quiche::h3::NameValue;
 
 use crate::dgram;
+use crate::io;
 use crate::quic::{self, CAPSULE_PROTOCOL_TRUE, MAX_DATAGRAM_SIZE};
 use crate::rules::RuleTable;
 use crate::util::{CHANNEL_CAP, RECV_BUF, hex, sleep_opt};
@@ -29,11 +30,14 @@ const LOCAL_CONN_ID_LEN: usize = 16;
 /// How often to sweep flows for the per-flow idle timeout.
 const FLOW_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 
-type ConnId = Vec<u8>;
+/// A server-chosen connection ID. Always [`LOCAL_CONN_ID_LEN`] bytes, so it is a
+/// cheap `Copy` routing key with no per-packet heap clone. (Client-chosen DCIDs,
+/// used as `routes` keys, are variable length and stay `Vec<u8>`.)
+type Scid = [u8; LOCAL_CONN_ID_LEN];
 
 /// A UDP payload received from a target, on its way back to a proxy client.
 struct ToClient {
-    conn_id: ConnId,
+    conn_id: Scid,
     flow_id: u64,
     payload: Vec<u8>,
 }
@@ -70,11 +74,11 @@ pub struct Server {
     server_config: Rc<ServerConfig>,
     h3_config: quiche::h3::Config,
     /// Active connections keyed by the server-chosen SCID.
-    clients: HashMap<ConnId, Client>,
+    clients: HashMap<Scid, Client>,
     /// Maps a client's original (handshake) DCID to our SCID, so early Initial
     /// retransmits route to the right connection before the client adopts our
     /// SCID as its DCID.
-    routes: HashMap<ConnId, ConnId>,
+    routes: HashMap<Vec<u8>, Scid>,
     to_client_tx: mpsc::Sender<ToClient>,
     to_client_rx: mpsc::Receiver<ToClient>,
 }
@@ -99,27 +103,8 @@ impl Server {
     pub async fn run(mut self) -> Result<()> {
         // Dedicated receive task: owns the recv side of the socket so it is
         // never cancelled by the main select, and forwards each datagram.
-        let (mut pkt_tx, mut pkt_rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(CHANNEL_CAP);
-        let recv_socket = self.socket.clone();
-        monoio::spawn(async move {
-            loop {
-                let buf = vec![0u8; RECV_BUF];
-                let (res, buf) = recv_socket.recv_from(buf).await;
-                match res {
-                    Ok((len, from)) => {
-                        let mut pkt = buf;
-                        pkt.truncate(len);
-                        if pkt_tx.try_send((pkt, from)).is_err() {
-                            // Channel full: drop (the peer will retransmit).
-                        }
-                    }
-                    Err(e) => {
-                        log::error!("udp recv failed: {e}");
-                        break;
-                    }
-                }
-            }
-        });
+        let (pkt_tx, mut pkt_rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(CHANNEL_CAP);
+        io::spawn_udp_recv(self.socket.clone(), pkt_tx, None);
 
         loop {
             let timeout = self.min_timeout();
@@ -172,13 +157,16 @@ impl Server {
                 return;
             }
         };
-        let dcid: ConnId = hdr.dcid.to_vec();
+        let dcid: Vec<u8> = hdr.dcid.to_vec();
 
-        // Route to an existing connection, by our SCID or the original DCID.
-        let conn_key = if self.clients.contains_key(&dcid) {
-            dcid.clone()
-        } else if let Some(scid) = self.routes.get(&dcid) {
-            scid.clone()
+        // Route to an existing connection, by our (fixed-length) SCID or the
+        // client's original DCID.
+        let conn_key: Scid = if let Some(scid) =
+            Scid::try_from(dcid.as_slice()).ok().filter(|s| self.clients.contains_key(s))
+        {
+            scid
+        } else if let Some(&scid) = self.routes.get(&dcid) {
+            scid
         } else {
             if hdr.ty != quiche::Type::Initial {
                 log::debug!(
@@ -223,8 +211,8 @@ impl Server {
     /// Accept a new connection. Generates a fixed-length server SCID (so short
     /// headers parse with `LOCAL_CONN_ID_LEN`), records the DCID→SCID route, and
     /// returns the SCID used as the connection's map key.
-    fn accept(&mut self, original_dcid: &ConnId, from: SocketAddr) -> Result<ConnId> {
-        let mut scid_bytes = [0u8; LOCAL_CONN_ID_LEN];
+    fn accept(&mut self, original_dcid: &[u8], from: SocketAddr) -> Result<Scid> {
+        let mut scid_bytes: Scid = [0u8; LOCAL_CONN_ID_LEN];
         rand::Rng::fill(&mut rand::thread_rng(), &mut scid_bytes[..]);
         let scid = quiche::ConnectionId::from_ref(&scid_bytes);
 
@@ -233,14 +221,13 @@ impl Server {
             .map_err(|e| anyhow!("quiche::accept: {e}"))?;
         drop(cfg);
 
-        let key = scid_bytes.to_vec();
         log::info!(
             "new QUIC connection from {from} (scid={}, dcid={})",
-            hex(&key),
+            hex(&scid_bytes),
             hex(original_dcid)
         );
         self.clients.insert(
-            key.clone(),
+            scid_bytes,
             Client {
                 conn,
                 http3: None,
@@ -248,8 +235,8 @@ impl Server {
                 peer: from,
             },
         );
-        self.routes.insert(original_dcid.clone(), key.clone());
-        Ok(key)
+        self.routes.insert(original_dcid.to_vec(), scid_bytes);
+        Ok(scid_bytes)
     }
 
     async fn send_version_negotiation(&self, hdr: &quiche::Header<'_>, from: SocketAddr) {
@@ -291,23 +278,8 @@ impl Server {
 
     async fn flush_all(&mut self) {
         for client in self.clients.values_mut() {
-            loop {
-                let mut out = vec![0u8; MAX_DATAGRAM_SIZE];
-                match client.conn.send(&mut out) {
-                    Ok((n, info)) => {
-                        out.truncate(n);
-                        let (res, _) = self.socket.send_to(out, info.to).await;
-                        if let Err(e) = res {
-                            log::debug!("udp send failed: {e}");
-                            break;
-                        }
-                    }
-                    Err(quiche::Error::Done) => break,
-                    Err(e) => {
-                        log::debug!("conn.send error: {e}");
-                        break;
-                    }
-                }
+            if let Err(e) = io::flush_connection(&self.socket, &mut client.conn).await {
+                log::debug!("flush failed: {e}");
             }
         }
     }
@@ -361,7 +333,7 @@ impl Server {
 /// and client→target datagrams for one connection.
 fn process_client(
     client: &mut Client,
-    conn_id: &ConnId,
+    conn_id: &Scid,
     h3_config: &quiche::h3::Config,
     server_config: &ServerConfig,
     to_client_tx: &mpsc::Sender<ToClient>,
@@ -435,7 +407,7 @@ fn handle_connect_request(
     headers: &[quiche::h3::Header],
     server_config: &ServerConfig,
     client_addr: SocketAddr,
-    conn_id: &ConnId,
+    conn_id: &Scid,
     to_client_tx: &mpsc::Sender<ToClient>,
 ) {
     let flow_id = stream_id / 4;
@@ -481,7 +453,7 @@ fn handle_connect_request(
         target_sock,
         to_target_rx,
         to_client_tx.clone(),
-        conn_id.clone(),
+        *conn_id,
         flow_id,
     ));
     flows.insert(
@@ -553,7 +525,7 @@ async fn target_task(
     target: UdpSocket,
     mut from_client: mpsc::Receiver<Vec<u8>>,
     mut to_client: mpsc::Sender<ToClient>,
-    conn_id: ConnId,
+    conn_id: Scid,
     flow_id: u64,
 ) {
     loop {
@@ -575,7 +547,7 @@ async fn target_task(
                 match res {
                     Ok(n) => {
                         let tc = ToClient {
-                            conn_id: conn_id.clone(),
+                            conn_id,
                             flow_id,
                             payload: buf[..n].to_vec(),
                         };

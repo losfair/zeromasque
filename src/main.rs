@@ -5,6 +5,7 @@ mod ech;
 #[cfg(test)]
 mod ech_test;
 mod endpoint;
+mod io;
 mod quic;
 mod reload;
 mod rules;

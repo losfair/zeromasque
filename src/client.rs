@@ -10,7 +10,7 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::rc::Rc;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use futures::StreamExt;
 use futures::channel::{mpsc, oneshot};
 use monoio::net::udp::UdpSocket;
@@ -18,7 +18,8 @@ use quiche::h3::NameValue;
 
 use crate::dgram;
 use crate::endpoint::Endpoint;
-use crate::quic::{self, CAPSULE_PROTOCOL_TRUE, MAX_DATAGRAM_SIZE, Verify};
+use crate::io;
+use crate::quic::{self, CAPSULE_PROTOCOL_TRUE, Verify};
 use crate::util::{CHANNEL_CAP, RECV_BUF, hex, sleep_opt};
 
 /// Keepalive cadence; keeps the tunnel from idling out between bursts and lets a
@@ -139,7 +140,8 @@ pub async fn run_proxy(opts: ProxyOptions) -> Result<()> {
 
     // The local recv task persists across reconnects, buffering datagrams that
     // arrive while the tunnel is briefly down.
-    let mut lrx = spawn_recv_task(lsock.clone());
+    let (ltx, mut lrx) = mpsc::channel(CHANNEL_CAP);
+    io::spawn_udp_recv(lsock.clone(), ltx, None);
 
     let mut backoff = RECONNECT_MIN;
     loop {
@@ -187,7 +189,7 @@ async fn run_session(
     let mut by_addr: HashMap<SocketAddr, FlowState> = HashMap::new();
     let mut flows: HashMap<u64, SocketAddr> = HashMap::new();
 
-    if let Err(e) = flush(&qsock, &mut conn).await {
+    if let Err(e) = io::flush_connection(&qsock, &mut conn).await {
         log::warn!("initial flush: {e}");
         return established;
     }
@@ -195,32 +197,11 @@ async fn run_session(
     // Dedicated QUIC receive task: drains the socket into a channel so the main
     // loop can absorb an entire inbound burst per wakeup. Reading one packet per
     // `select!` iteration starves download reads under a busy uplink, overflowing
-    // the recv buffer and collapsing the download congestion window. The task is
-    // cancelled when this session ends (dropping `_recv_cancel` resolves
-    // `cancel_rx`), so reconnect teardown stays clean with nothing left dangling.
-    let (mut qpkt_tx, mut qpkt_rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(CHANNEL_CAP);
-    let (_recv_cancel, mut cancel_rx) = oneshot::channel::<()>();
-    let recv_qsock = qsock.clone();
-    monoio::spawn(async move {
-        loop {
-            let buf = vec![0u8; RECV_BUF];
-            monoio::select! {
-                r = recv_qsock.recv_from(buf) => {
-                    let (res, buf) = r;
-                    match res {
-                        Ok((n, from)) => {
-                            let mut b = buf;
-                            b.truncate(n);
-                            // Drop on full: QUIC datagrams are lossy by contract.
-                            let _ = qpkt_tx.try_send((b, from));
-                        }
-                        Err(_) => break,
-                    }
-                }
-                _ = &mut cancel_rx => break,
-            }
-        }
-    });
+    // the recv buffer and collapsing the download congestion window. Dropping
+    // `_recv_cancel` on return stops the task, so reconnect teardown stays clean.
+    let (qpkt_tx, mut qpkt_rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(CHANNEL_CAP);
+    let (_recv_cancel, cancel_rx) = oneshot::channel::<()>();
+    io::spawn_udp_recv(qsock.clone(), qpkt_tx, Some(cancel_rx));
 
     loop {
         let timeout = conn.timeout();
@@ -313,36 +294,11 @@ async fn run_session(
             route_tunnel_datagrams(&mut conn, lsock, &flows).await;
         }
 
-        if let Err(e) = flush(&qsock, &mut conn).await {
+        if let Err(e) = io::flush_connection(&qsock, &mut conn).await {
             log::warn!("flush: {e}");
             return established;
         }
     }
-}
-
-/// Spawn a task that reads datagrams from `socket` and forwards `(data, src)`.
-fn spawn_recv_task(socket: Rc<UdpSocket>) -> mpsc::Receiver<(Vec<u8>, SocketAddr)> {
-    let (mut tx, rx) = mpsc::channel(CHANNEL_CAP);
-    monoio::spawn(async move {
-        loop {
-            let buf = vec![0u8; RECV_BUF];
-            let (res, buf) = socket.recv_from(buf).await;
-            match res {
-                Ok((n, src)) => {
-                    let mut p = buf;
-                    p.truncate(n);
-                    if tx.try_send((p, src)).is_err() {
-                        // Channel full: drop (callers tolerate UDP loss).
-                    }
-                }
-                Err(e) => {
-                    log::debug!("recv task ended: {e}");
-                    break;
-                }
-            }
-        }
-    });
-    rx
 }
 
 /// Send a CONNECT request for any local source that doesn't have a flow yet, and
@@ -484,24 +440,6 @@ fn send_datagram(conn: &mut quiche::Connection, flow_id: u64, data: &[u8]) {
         ),
         Err(e) => log::debug!("dgram_send failed: {e}"),
     }
-}
-
-// ===================== shared helpers =====================
-
-async fn flush(socket: &UdpSocket, conn: &mut quiche::Connection) -> Result<()> {
-    loop {
-        let mut out = vec![0u8; MAX_DATAGRAM_SIZE];
-        match conn.send(&mut out) {
-            Ok((n, info)) => {
-                out.truncate(n);
-                let (res, _) = socket.send_to(out, info.to).await;
-                res.context("client udp send")?;
-            }
-            Err(quiche::Error::Done) => break,
-            Err(e) => bail!("conn.send: {e}"),
-        }
-    }
-    Ok(())
 }
 
 fn status_of(headers: &[quiche::h3::Header]) -> Option<u16> {
