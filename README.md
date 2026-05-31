@@ -1,12 +1,15 @@
 # zeromasque
 
 An io_uring-based **MASQUE / CONNECT-UDP** proxy and client written in Rust,
-built on [`monoio`](https://github.com/bytedance/monoio) (io_uring),
+built on [`monoio`](https://github.com/bytedance/monoio),
 [`quiche`](https://github.com/cloudflare/quiche) (QUIC + HTTP/3) and
 [`boring`](https://github.com/cloudflare/boring) (BoringSSL). It implements the
 CONNECT-UDP protocol of [RFC 9298](https://www.rfc-editor.org/rfc/rfc9298) and
-supports **TLS certificate hot reload** and **Encrypted Client Hello (ECH)** on
-both the server (termination) and client (offering).
+supports **TLS certificate hot reload** (Linux) and **Encrypted Client Hello
+(ECH)** on both the server (termination) and client (offering).
+
+The runtime uses monoio's `FusionDriver`: io_uring on Linux (with an epoll
+fallback when io_uring is unavailable) and the kqueue backend on macOS/BSD.
 
 It interoperates with [masque-go](https://github.com/quic-go/masque-go), the
 quic-go reference implementation, in both directions.
@@ -44,7 +47,7 @@ The URI template uses the two RFC 9298 variables `{target_host}` and
 `{target_port}`. Both the query form above and the well-known path form
 (`.../.well-known/masque/udp/{target_host}/{target_port}/`) are supported.
 
-### Certificate hot reload
+### Certificate hot reload (Linux only)
 
 Send `SIGHUP` to rebuild the TLS/ECH configuration from the cert, key and ECH
 files. New connections pick up the rotated material; existing connections keep
@@ -54,6 +57,10 @@ file) is logged and the previous configuration is retained.
 ```
 kill -SIGHUP "$(pidof zeromasque)"
 ```
+
+Hot reload relies on `signalfd`, which is Linux-only. On other platforms it is
+disabled (SIGHUP is ignored) and the server keeps the configuration it started
+with; restart to pick up new certificates.
 
 ### Encrypted Client Hello (ECH)
 
@@ -114,7 +121,8 @@ certificate-reload check that confirms the served certificate changes.
 - `src/server.rs` - the io_uring CONNECT-UDP proxy event loop.
 - `src/client.rs` - the MASQUE client.
 - `src/quic.rs` - quiche transport + BoringSSL configuration, ECH install hooks.
-- `src/reload.rs` - `signalfd`-driven SIGHUP cert/ECH hot reload.
+- `src/reload.rs` - `signalfd`-driven SIGHUP cert/ECH hot reload (Linux; a no-op
+  stub elsewhere).
 - `src/template.rs`, `src/dgram.rs`, `src/varint.rs` - URI templates and HTTP/3
   datagram / QUIC varint framing.
 - `src/ech/` - ECH key material: wire format, PEM key files, keygen (ported from
@@ -129,3 +137,5 @@ certificate-reload check that confirms the served certificate changes.
   perform QUIC Retry / stateless address validation; it is intended for trusted
   deployments and interop testing, not open-internet hardening.
 - Unlike zeroserve, the proxy does not (yet) apply namespace/landlock sandboxing.
+- Linux gets the full feature set (io_uring + certificate hot reload). macOS/BSD
+  run on the kqueue backend without hot reload; restart to rotate certificates.

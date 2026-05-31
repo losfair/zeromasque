@@ -14,7 +14,7 @@ use std::rc::Rc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use monoio::{IoUringDriver, RuntimeBuilder};
+use monoio::{FusionDriver, RuntimeBuilder};
 
 use crate::cli::{Cli, ClientArgs, Command, GenEchArgs, ServeArgs};
 use crate::ech::key::EchKeySet;
@@ -68,10 +68,10 @@ fn serve(args: ServeArgs) -> Result<()> {
     // Block SIGHUP before the runtime starts any work.
     let blocked = SighupBlocked::new();
 
-    RuntimeBuilder::<IoUringDriver>::new()
+    RuntimeBuilder::<FusionDriver>::new()
         .enable_timer()
         .build()
-        .expect("failed to build io_uring runtime")
+        .expect("failed to build monoio runtime")
         .block_on(async move {
             let socket = monoio::net::udp::UdpSocket::bind(args.addr)
                 .with_context(|| format!("binding QUIC listener {}", args.addr))?;
@@ -111,10 +111,10 @@ fn client(args: ClientArgs) -> Result<()> {
         response_window,
     };
 
-    RuntimeBuilder::<IoUringDriver>::new()
+    RuntimeBuilder::<FusionDriver>::new()
         .enable_timer()
         .build()
-        .expect("failed to build io_uring runtime")
+        .expect("failed to build monoio runtime")
         .block_on(client::run(opts))
 }
 

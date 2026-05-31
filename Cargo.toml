@@ -27,7 +27,9 @@ boring = "4"
 # client-side ECH injection.
 boring-sys = "4"
 foreign-types-shared = "0.3"
-monoio = { version = "0.2", default-features = false, features = ["async-cancel", "bytes", "iouring", "poll-io", "utils", "sync", "macros"] }
+# `iouring` (Linux) + `legacy` (epoll/kqueue) so the FusionDriver can select
+# io_uring on Linux and fall back to kqueue on macOS / epoll elsewhere.
+monoio = { version = "0.2", default-features = false, features = ["async-cancel", "bytes", "iouring", "legacy", "poll-io", "utils", "sync", "macros"] }
 quiche = { version = "0.29", default-features = false, features = ["boringssl-boring-crate"] }
 
 [patch.crates-io]

@@ -14,7 +14,18 @@
 - `cargo test` — unit tests, including an in-memory BoringSSL ECH handshake.
 - `./testing/interop.sh` — end-to-end interop against masque-go (needs `go` and a
   masque-go checkout at `../masque-go`, override with `MASQUE_GO=`).
-- `kill -SIGHUP <pid>` — hot-reload the server's TLS certificate and ECH keys.
+- `kill -SIGHUP <pid>` — hot-reload the server's TLS certificate and ECH keys
+  (Linux only).
+
+## Platform Support
+
+The runtime uses monoio's `FusionDriver` (io_uring on Linux with an epoll
+fallback; kqueue on macOS/BSD), so both the `iouring` and `legacy` monoio
+features are enabled. Certificate hot reload uses `signalfd` and is gated to
+Linux in `src/reload.rs`; the `#[cfg(not(target_os = "linux"))]` variant ignores
+SIGHUP and logs that reload is unavailable. Keep both `reload.rs` cfg branches'
+`SighupBlocked` / `spawn_reload` signatures identical so `main.rs` compiles on
+every target.
 
 ## Coding Style & Naming Conventions
 
