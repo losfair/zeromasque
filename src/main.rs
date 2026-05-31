@@ -88,6 +88,7 @@ fn serve(args: ServeArgs) -> Result<()> {
         .block_on(async move {
             let socket = monoio::net::udp::UdpSocket::bind(args.addr)
                 .with_context(|| format!("binding QUIC listener {}", args.addr))?;
+            quic::enlarge_udp_buffers(std::os::fd::AsRawFd::as_raw_fd(&socket));
             eprintln!("zeromasque proxy listening on {} (udp)", args.addr);
 
             spawn_reload(server_config.clone(), reload_paths, blocked)?;

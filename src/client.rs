@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use futures::StreamExt;
-use futures::channel::mpsc;
+use futures::channel::{mpsc, oneshot};
 use monoio::net::udp::UdpSocket;
 use quiche::h3::NameValue;
 
@@ -20,7 +20,15 @@ use crate::dgram;
 use crate::endpoint::Endpoint;
 use crate::quic::{self, Verify};
 
-const MAX_DATAGRAM_SIZE: usize = 1350;
+/// Output buffer size for `conn.send()`. MUST be at least
+/// `quic::MAX_UDP_PAYLOAD` (the configured `max_send_udp_payload_size`): quiche
+/// admits a DATAGRAM into its send queue based on `dgram_max_writable_len()`,
+/// which is derived from `max_send_udp_payload_size`, but can only serialize it
+/// into a packet that fits this buffer. A buffer smaller than that lets quiche
+/// queue a datagram it can never emit — it sticks at the head of the FIFO
+/// datagram queue and silently blocks every datagram behind it forever (only a
+/// reconnect clears it). So we size the buffer to the payload ceiling.
+const MAX_DATAGRAM_SIZE: usize = quic::MAX_UDP_PAYLOAD;
 const RECV_BUF: usize = 65535;
 const CHANNEL_CAP: usize = 1024;
 const CAPSULE_PROTOCOL_TRUE: &[u8] = b"?1";
@@ -75,6 +83,7 @@ fn dial(p: &ConnectParams) -> Result<Dialed> {
         "[::]:0".parse().unwrap()
     };
     let socket = UdpSocket::bind(bind).context("binding client UDP socket")?;
+    quic::enlarge_udp_buffers(std::os::fd::AsRawFd::as_raw_fd(&socket));
     let local_addr = socket.local_addr().context("client local addr")?;
 
     let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
@@ -136,6 +145,7 @@ pub async fn run_proxy(opts: ProxyOptions) -> Result<()> {
         UdpSocket::bind(opts.listen)
             .with_context(|| format!("binding local UDP listen socket {}", opts.listen))?,
     );
+    quic::enlarge_udp_buffers(std::os::fd::AsRawFd::as_raw_fd(&*lsock));
     log::info!("local UDP proxy listening on {}", opts.listen);
 
     // The local recv task persists across reconnects, buffering datagrams that
@@ -193,30 +203,63 @@ async fn run_session(
         return established;
     }
 
+    // Dedicated QUIC receive task: drains the socket into a channel so the main
+    // loop can absorb an entire inbound burst per wakeup. Reading one packet per
+    // `select!` iteration starves download reads under a busy uplink, overflowing
+    // the recv buffer and collapsing the download congestion window. The task is
+    // cancelled when this session ends (dropping `_recv_cancel` resolves
+    // `cancel_rx`), so reconnect teardown stays clean with nothing left dangling.
+    let (mut qpkt_tx, mut qpkt_rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(CHANNEL_CAP);
+    let (_recv_cancel, mut cancel_rx) = oneshot::channel::<()>();
+    let recv_qsock = qsock.clone();
+    monoio::spawn(async move {
+        loop {
+            let buf = vec![0u8; RECV_BUF];
+            monoio::select! {
+                r = recv_qsock.recv_from(buf) => {
+                    let (res, buf) = r;
+                    match res {
+                        Ok((n, from)) => {
+                            let mut b = buf;
+                            b.truncate(n);
+                            // Drop on full: QUIC datagrams are lossy by contract.
+                            let _ = qpkt_tx.try_send((b, from));
+                        }
+                        Err(_) => break,
+                    }
+                }
+                _ = &mut cancel_rx => break,
+            }
+        }
+    });
+
     loop {
         let timeout = conn.timeout();
-        // The QUIC socket is read inline (no per-session task) so the session
-        // tears down cleanly on reconnect with nothing left dangling.
-        let qbuf = vec![0u8; RECV_BUF];
-        let mut proxy_pkt = None;
-        let mut local_pkt = None;
+        let mut proxy_pkts: Vec<(Vec<u8>, SocketAddr)> = Vec::new();
+        let mut local_pkts: Vec<(Vec<u8>, SocketAddr)> = Vec::new();
         let mut do_keepalive = false;
         let mut do_timeout = false;
         monoio::select! {
-            q = qsock.recv_from(qbuf) => {
-                let (res, buf) = q;
-                if let Ok((n, from)) = res {
-                    let mut b = buf;
-                    b.truncate(n);
-                    proxy_pkt = Some((b, from));
+            q = qpkt_rx.next() => {
+                match q {
+                    Some(p) => proxy_pkts.push(p),
+                    None => return established, // recv task ended (socket error)
                 }
             }
-            l = lrx.next() => { local_pkt = l; }
+            l = lrx.next() => { if let Some(p) = l { local_pkts.push(p); } }
             _ = sleep_opt(timeout) => { do_timeout = true; }
             _ = monoio::time::sleep(KEEPALIVE) => { do_keepalive = true; }
         }
+        // Drain everything already queued in both directions, so one wakeup
+        // processes a whole burst: prompt ACKs and no recv-buffer overflow.
+        while let Ok(p) = qpkt_rx.try_recv() {
+            proxy_pkts.push(p);
+        }
+        while let Ok(p) = lrx.try_recv() {
+            local_pkts.push(p);
+        }
 
-        if let Some((mut buf, from)) = proxy_pkt {
+        for (mut buf, from) in proxy_pkts {
             let info = quiche::RecvInfo {
                 to: local_addr,
                 from,
@@ -257,9 +300,9 @@ async fn run_session(
             }
         }
 
-        // Queue a freshly received local datagram for its flow. Forward
-        // immediately once the flow is established; otherwise buffer until 200.
-        if let Some((data, src)) = local_pkt {
+        // Queue freshly received local datagrams for their flows. Forward
+        // immediately once a flow is established; otherwise buffer until 200.
+        for (data, src) in local_pkts {
             let st = by_addr.entry(src).or_insert_with(|| FlowState {
                 flow_id: None,
                 established: false,

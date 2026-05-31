@@ -21,7 +21,15 @@ use crate::dgram;
 use crate::quic;
 use crate::rules::RuleTable;
 
-const MAX_DATAGRAM_SIZE: usize = 1350;
+/// Output buffer size for `conn.send()`. MUST be at least
+/// `quic::MAX_UDP_PAYLOAD` (the configured `max_send_udp_payload_size`): quiche
+/// admits a DATAGRAM into its send queue based on `dgram_max_writable_len()`,
+/// which is derived from `max_send_udp_payload_size`, but can only serialize it
+/// into a packet that fits this buffer. A buffer smaller than that lets quiche
+/// queue a datagram it can never emit — it sticks at the head of the FIFO
+/// datagram queue and silently blocks every datagram behind it forever (only a
+/// reconnect clears it). So we size the buffer to the payload ceiling.
+const MAX_DATAGRAM_SIZE: usize = quic::MAX_UDP_PAYLOAD;
 const RECV_BUF: usize = 65535;
 const CHANNEL_CAP: usize = 1024;
 /// Fixed length of the connection IDs this server issues. Short-header packets
@@ -133,9 +141,21 @@ impl Server {
                         Some((mut data, from)) => self.on_packet(&mut data, from).await,
                         None => break,
                     }
+                    // Drain the rest of the inbound burst before flushing: one
+                    // batch of work then one batch of output, instead of a full
+                    // flush per packet. This keeps ACKs prompt and low-jitter
+                    // under load (a slow ACK clock throttles the peer's cwnd).
+                    while let Ok((mut data, from)) = pkt_rx.try_recv() {
+                        self.on_packet(&mut data, from).await;
+                    }
                 }
                 tc = self.to_client_rx.next() => {
                     if let Some(tc) = tc { self.on_target_payload(tc); }
+                    // Queue every ready target->client payload into the datagram
+                    // send queue, then flush them together below.
+                    while let Ok(tc) = self.to_client_rx.try_recv() {
+                        self.on_target_payload(tc);
+                    }
                 }
                 _ = sleep_opt(timeout) => {
                     for client in self.clients.values_mut() {
@@ -662,6 +682,7 @@ fn bind_target(
     // Connect with std (synchronous, non-blocking for datagram sockets) so the
     // socket has a fixed peer, then adopt it into monoio's io_uring driver.
     let std_sock = std::net::UdpSocket::bind(bind).context("binding target UDP socket")?;
+    quic::enlarge_udp_buffers(std::os::fd::AsRawFd::as_raw_fd(&std_sock));
     #[cfg(target_os = "linux")]
     if let Some(mark) = fwmark {
         use std::os::fd::AsRawFd;
@@ -723,6 +744,7 @@ fn bind_target_transparent(
 
     let make = |src: SocketAddr| -> std::io::Result<Socket> {
         let sock = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+        quic::enlarge_udp_buffers(sock.as_raw_fd());
         // IP_TRANSPARENT must be set before bind; it requires CAP_NET_ADMIN.
         let one: libc::c_int = 1;
         let (level, optname) = if is_v6 {

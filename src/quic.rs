@@ -29,9 +29,50 @@ const ALPN_H3: &[&[u8]] = &[b"h3"];
 /// must probe up to this ceiling); where it cannot, oversize flows are dropped
 /// and warned about at the send sites. 1280-MTU inner tunnels (e.g. IPv6
 /// WireGuard) cannot go lower, so the budget has to absorb them here.
-const MAX_UDP_PAYLOAD: usize = 1400;
+pub(crate) const MAX_UDP_PAYLOAD: usize = 1400;
 const IDLE_TIMEOUT_MS: u64 = 10_000;
 const DGRAM_QUEUE_LEN: usize = 65536;
+
+/// Size requested (per direction) for every UDP socket's kernel buffers.
+///
+/// The whole tunnel is one QUIC connection; on a high-RTT path its
+/// bandwidth-delay product is large (e.g. 20 Mbit/s × 270 ms ≈ 675 KB). The
+/// default socket buffer (~208 KB on stock Linux) is far smaller, so an
+/// in-flight burst overflows it and packets are dropped. Because CONNECT-UDP
+/// rides *unreliable* QUIC DATAGRAMs (no retransmission), every such drop
+/// surfaces as loss to the tunnelled protocol — and at high RTT even a few
+/// percent loss collapses an inner TCP flow (Mathis: BW ≈ MSS/(RTT·√p)). Sizing
+/// the buffers to absorb the BDP is the single biggest throughput lever.
+///
+/// NOTE: the kernel clamps the effective size to `net.core.rmem_max` /
+/// `wmem_max`. On stock Linux those default to ~208 KB, which would silently cap
+/// this request — operators on high-RTT links must raise them (see README).
+const SOCKET_BUFFER_BYTES: libc::c_int = 8 * 1024 * 1024;
+
+/// Enlarge a UDP socket's send and receive buffers to [`SOCKET_BUFFER_BYTES`]
+/// (best effort; failures are logged, not fatal). Call right after binding —
+/// applies to both monoio and std sockets via the raw fd.
+#[cfg(unix)]
+pub(crate) fn enlarge_udp_buffers(fd: std::os::fd::RawFd) {
+    for (opt, name) in [(libc::SO_RCVBUF, "SO_RCVBUF"), (libc::SO_SNDBUF, "SO_SNDBUF")] {
+        let sz = SOCKET_BUFFER_BYTES;
+        let rc = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                opt,
+                &sz as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if rc != 0 {
+            log::debug!("setsockopt {name} failed: {}", std::io::Error::last_os_error());
+        }
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn enlarge_udp_buffers(_fd: std::os::fd::RawFd) {}
 
 /// Apply the QUIC transport parameters common to client and server.
 fn apply_transport_params(config: &mut quiche::Config) -> Result<()> {
@@ -39,6 +80,17 @@ fn apply_transport_params(config: &mut quiche::Config) -> Result<()> {
         .set_application_protos(ALPN_H3)
         .context("setting ALPN h3")?;
     config.set_max_idle_timeout(IDLE_TIMEOUT_MS);
+    // The whole tunnel is one QUIC connection and every UDP payload rides an
+    // (unreliable but still congestion-controlled — RFC 9221 §5) DATAGRAM frame.
+    // The default CUBIC is a poor outer controller for a tunnel over a high-RTT,
+    // sporadically-lossy path: it treats any loss as congestion and backs off
+    // multiplicatively, and recovery at high RTT is glacial — so path loss
+    // collapses the tunnel, which then starves the (already loss-based) inner
+    // protocol. BBRv2 is rate/model-based, tolerates non-congestive loss, and
+    // presents a smoother, higher-bandwidth pipe to whatever is tunnelled.
+    config
+        .set_cc_algorithm_name("bbr2_gcongestion")
+        .context("selecting BBRv2 congestion control")?;
     config.set_max_recv_udp_payload_size(MAX_UDP_PAYLOAD);
     config.set_max_send_udp_payload_size(MAX_UDP_PAYLOAD);
     config.set_initial_max_data(10_000_000);

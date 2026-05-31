@@ -242,6 +242,35 @@ NAT mappings warm and makes a dead path detectable within the 10 s idle timeout.
 The server reaps connections that idle out and closes their target sockets, so
 vanished clients don't leak resources.
 
+## Performance & tuning (high-RTT links)
+
+The whole tunnel is a single QUIC connection and every UDP payload rides an
+*unreliable* QUIC DATAGRAM (RFC 9297/9298) — there is no tunnel-level
+retransmission, by design. The consequence: any packet the kernel drops because
+a UDP socket buffer overflowed becomes a loss the *tunnelled* protocol must
+recover from. Over a high-RTT path even a few percent loss collapses an inner
+TCP flow (Mathis: throughput ≈ MSS / (RTT·√loss)), so a tunnel that drops 40 %
+of a burst can crush a 20 Mbit/s TCP transfer down to a few hundred Kbit/s.
+
+zeromasque therefore requests large send/receive buffers (8 MB) on every UDP
+socket. **The kernel silently clamps that request to `net.core.rmem_max` /
+`net.core.wmem_max`, which default to ~208 KB on stock Linux** — far below the
+bandwidth-delay product of a fast, high-latency link (e.g. 20 Mbit/s × 270 ms ≈
+675 KB). On both the proxy host and the client host, raise those ceilings:
+
+```sh
+sudo sysctl -w net.core.rmem_max=16777216 net.core.wmem_max=16777216
+# persist in /etc/sysctl.d/99-zeromasque.conf:
+#   net.core.rmem_max = 16777216
+#   net.core.wmem_max = 16777216
+```
+
+Measured over an emulated 270 ms RTT path, this takes a 2000 pkt/s
+(~19 Mbit/s) flow from ~40–60 % loss (erratic) to a stable ~3 %. Also keep the
+tunnelled interface's MTU low enough that an inner packet plus encapsulation
+fits one QUIC DATAGRAM (these cannot fragment); see the datagram-size note in
+`src/quic.rs`.
+
 ## Notes & limitations
 
 - Only context ID 0 (raw UDP payloads) is proxied; other HTTP-datagram contexts
