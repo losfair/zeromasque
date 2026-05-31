@@ -185,6 +185,18 @@ certificate changes.
   zeroserve, adapted to boring 4 / `boring-sys` HPKE keygen).
 - `testing/` - interop harness and Go helpers.
 
+## Resilience
+
+The client never exits: it redials the proxy indefinitely with capped
+exponential backoff (100 ms → 5 s), so a server restart, a dropped NAT mapping,
+or any transient failure recovers automatically. The local listen socket stays
+bound across reconnects, and flows reopen lazily as local datagrams arrive (apps
+retransmit lost UDP and self-heal). A 1 s keepalive (ack-eliciting) keeps idle
+NAT mappings warm and makes a dead path detectable within the 10 s idle timeout.
+
+The server reaps connections that idle out and closes their target sockets, so
+vanished clients don't leak resources.
+
 ## Notes & limitations
 
 - Only context ID 0 (raw UDP payloads) is proxied; other HTTP-datagram contexts

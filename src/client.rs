@@ -24,10 +24,15 @@ const MAX_DATAGRAM_SIZE: usize = 1350;
 const RECV_BUF: usize = 65535;
 const CHANNEL_CAP: usize = 1024;
 const CAPSULE_PROTOCOL_TRUE: &[u8] = b"?1";
-/// Keepalive cadence; keeps the tunnel from idling out between bursts.
-const KEEPALIVE: Duration = Duration::from_secs(15);
+/// Keepalive cadence; keeps the tunnel from idling out between bursts and lets a
+/// dead path be detected quickly.
+const KEEPALIVE: Duration = Duration::from_secs(1);
 /// Per-source bound on datagrams buffered before the flow's request is sent.
 const MAX_PENDING: usize = 32;
+/// Reconnect backoff bounds. The client never gives up; it keeps redialing the
+/// proxy, backing off on repeated failures and resetting once a tunnel comes up.
+const RECONNECT_MIN: Duration = Duration::from_millis(100);
+const RECONNECT_MAX: Duration = Duration::from_secs(5);
 
 /// Connection parameters for the proxy client.
 pub struct ConnectParams {
@@ -121,57 +126,94 @@ struct FlowState {
     pending: Vec<Vec<u8>>,
 }
 
-/// Run as a local UDP→CONNECT-UDP proxy: each local source address gets its own
-/// tunnelled flow, and replies are routed back to the right source.
+/// Run as a local UDP→CONNECT-UDP proxy. The local listen socket is bound once
+/// and persists; the QUIC connection to the proxy is (re)established in a loop
+/// that never gives up, so a server restart, a dropped NAT mapping, or any other
+/// failure recovers automatically. Flows reopen lazily as local datagrams
+/// arrive (apps retransmit lost UDP, so they self-heal).
 pub async fn run_proxy(opts: ProxyOptions) -> Result<()> {
-    let Dialed {
-        socket: qsock,
-        mut conn,
-        local_addr,
-        path,
-        authority,
-    } = dial(&opts.conn)?;
-
     let lsock = Rc::new(
         UdpSocket::bind(opts.listen)
             .with_context(|| format!("binding local UDP listen socket {}", opts.listen))?,
     );
     log::info!("local UDP proxy listening on {}", opts.listen);
 
-    let h3_config = quic::build_h3_config()?;
-    let mut http3: Option<quiche::h3::Connection> = None;
+    // The local recv task persists across reconnects, buffering datagrams that
+    // arrive while the tunnel is briefly down.
+    let mut lrx = spawn_recv_task(lsock.clone());
 
+    let mut backoff = RECONNECT_MIN;
+    loop {
+        let established = run_session(&opts.conn, &lsock, &mut lrx).await;
+        if established {
+            backoff = RECONNECT_MIN;
+        }
+        log::warn!("tunnel down; reconnecting in {backoff:?}");
+        monoio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(RECONNECT_MAX);
+    }
+}
+
+/// Drive one connection lifetime to the proxy. Returns whether the tunnel became
+/// established (so the caller resets its backoff). Never propagates connection
+/// errors: on any failure it logs and returns so the caller reconnects.
+async fn run_session(
+    p: &ConnectParams,
+    lsock: &Rc<UdpSocket>,
+    lrx: &mut mpsc::Receiver<(Vec<u8>, SocketAddr)>,
+) -> bool {
+    let Dialed {
+        socket: qsock,
+        mut conn,
+        local_addr,
+        path,
+        authority,
+    } = match dial(p) {
+        Ok(d) => d,
+        Err(e) => {
+            log::warn!("dial failed: {e}");
+            return false;
+        }
+    };
+
+    let h3_config = match quic::build_h3_config() {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!("h3 config: {e}");
+            return false;
+        }
+    };
+    let mut http3: Option<quiche::h3::Connection> = None;
+    let mut established = false;
     let mut by_addr: HashMap<SocketAddr, FlowState> = HashMap::new();
     let mut flows: HashMap<u64, SocketAddr> = HashMap::new();
 
-    // Receive tasks own the recv side of each socket so they are never cancelled
-    // by the main select.
-    let mut prx = spawn_recv_task(qsock.clone());
-    let mut lrx = spawn_recv_task(lsock.clone());
-
-    let (mut ka_tx, mut ka_rx) = mpsc::channel::<()>(1);
-    monoio::spawn(async move {
-        loop {
-            monoio::time::sleep(KEEPALIVE).await;
-            if ka_tx.try_send(()).is_err() {
-                break;
-            }
-        }
-    });
-
-    flush(&qsock, &mut conn).await?;
+    if let Err(e) = flush(&qsock, &mut conn).await {
+        log::warn!("initial flush: {e}");
+        return established;
+    }
 
     loop {
         let timeout = conn.timeout();
+        // The QUIC socket is read inline (no per-session task) so the session
+        // tears down cleanly on reconnect with nothing left dangling.
+        let qbuf = vec![0u8; RECV_BUF];
         let mut proxy_pkt = None;
         let mut local_pkt = None;
         let mut do_keepalive = false;
         let mut do_timeout = false;
         monoio::select! {
-            p = prx.next() => { proxy_pkt = p; }
+            q = qsock.recv_from(qbuf) => {
+                let (res, buf) = q;
+                if let Ok((n, from)) = res {
+                    let mut b = buf;
+                    b.truncate(n);
+                    proxy_pkt = Some((b, from));
+                }
+            }
             l = lrx.next() => { local_pkt = l; }
-            _ = ka_rx.next() => { do_keepalive = true; }
             _ = sleep_opt(timeout) => { do_timeout = true; }
+            _ = monoio::time::sleep(KEEPALIVE) => { do_keepalive = true; }
         }
 
         if let Some((mut buf, from)) = proxy_pkt {
@@ -191,7 +233,8 @@ pub async fn run_proxy(opts: ProxyOptions) -> Result<()> {
         }
 
         if conn.is_closed() {
-            bail!("proxy connection closed: {:?}", conn.stats());
+            log::info!("tunnel closed: {:?}", conn.stats());
+            return established;
         }
 
         if (conn.is_established() || conn.is_in_early_data()) && http3.is_none() {
@@ -201,11 +244,17 @@ pub async fn run_proxy(opts: ProxyOptions) -> Result<()> {
                     hex(&boring::sha::sha256(der))
                 );
             }
-            http3 = Some(
-                quiche::h3::Connection::with_transport(&mut conn, &h3_config)
-                    .map_err(|e| anyhow!("h3 with_transport: {e}"))?,
-            );
-            log::info!("tunnel established");
+            match quiche::h3::Connection::with_transport(&mut conn, &h3_config) {
+                Ok(h3) => {
+                    http3 = Some(h3);
+                    established = true;
+                    log::info!("tunnel established");
+                }
+                Err(e) => {
+                    log::warn!("h3 with_transport: {e}");
+                    return established;
+                }
+            }
         }
 
         // Queue a freshly received local datagram for its flow. Forward
@@ -229,10 +278,13 @@ pub async fn run_proxy(opts: ProxyOptions) -> Result<()> {
         if let Some(h3) = http3.as_mut() {
             open_pending_flows(&mut conn, h3, &authority, &path, &mut by_addr, &mut flows);
             poll_responses(&mut conn, h3, &mut by_addr, &mut flows);
-            route_tunnel_datagrams(&mut conn, &lsock, &flows).await;
+            route_tunnel_datagrams(&mut conn, lsock, &flows).await;
         }
 
-        flush(&qsock, &mut conn).await?;
+        if let Err(e) = flush(&qsock, &mut conn).await {
+            log::warn!("flush: {e}");
+            return established;
+        }
     }
 }
 

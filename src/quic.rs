@@ -20,7 +20,7 @@ use crate::ech::key::EchKeySet;
 const ALPN_H3: &[&[u8]] = &[b"h3"];
 /// Increased initial packet size so tunnelled QUIC (min MTU 1200) fits.
 const MAX_UDP_PAYLOAD: usize = 1350;
-const IDLE_TIMEOUT_MS: u64 = 30_000;
+const IDLE_TIMEOUT_MS: u64 = 10_000;
 const DGRAM_QUEUE_LEN: usize = 65536;
 
 /// Apply the QUIC transport parameters common to client and server.
