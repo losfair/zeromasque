@@ -263,6 +263,15 @@ impl Server {
             let datagram = dgram::encode(tc.flow_id, &tc.payload);
             match client.conn.dgram_send(&datagram) {
                 Ok(()) | Err(quiche::Error::Done) => {}
+                Err(quiche::Error::BufferTooShort) => log::warn!(
+                    "dropping {}-byte reply datagram on flow {}: exceeds writable QUIC \
+                     datagram ({:?}B). The target's reply is too large for the \
+                     client<->proxy path MTU; QUIC DATAGRAMs cannot fragment. Lower the \
+                     tunnelled interface MTU or ensure the proxy path carries larger packets.",
+                    datagram.len(),
+                    tc.flow_id,
+                    client.conn.dgram_max_writable_len(),
+                ),
                 Err(e) => log::debug!("dgram_send to client failed: {e}"),
             }
             // Target→client traffic keeps the flow alive.

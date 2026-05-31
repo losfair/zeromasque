@@ -18,8 +18,18 @@ use crate::ech::key::EchKeySet;
 
 /// ALPN protocol list quiche offers/selects: HTTP/3 only.
 const ALPN_H3: &[&[u8]] = &[b"h3"];
-/// Increased initial packet size so tunnelled QUIC (min MTU 1200) fits.
-const MAX_UDP_PAYLOAD: usize = 1350;
+/// Outer (client<->proxy) QUIC packet size ceiling. Sized so a full 1280-MTU
+/// inner datagram survives the trip: a 1280-byte IPv6 packet inside WireGuard is
+/// a 1312-byte UDP payload (16B header + 16B tag), plus our 2B HTTP-datagram
+/// prefix = 1314B that must fit in one QUIC DATAGRAM frame (which cannot be
+/// fragmented). The binding direction is proxy->client, whose short header
+/// carries the client's 20-byte connection ID; at 1400 the writable datagram is
+/// ~1358B, clearing 1314 with margin. The underlying client<->proxy path must
+/// therefore carry ~1450-byte IP packets unfragmented (and quiche's DPLPMTUD
+/// must probe up to this ceiling); where it cannot, oversize flows are dropped
+/// and warned about at the send sites. 1280-MTU inner tunnels (e.g. IPv6
+/// WireGuard) cannot go lower, so the budget has to absorb them here.
+const MAX_UDP_PAYLOAD: usize = 1400;
 const IDLE_TIMEOUT_MS: u64 = 10_000;
 const DGRAM_QUEUE_LEN: usize = 65536;
 

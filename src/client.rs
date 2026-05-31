@@ -442,6 +442,14 @@ fn send_datagram(conn: &mut quiche::Connection, flow_id: u64, data: &[u8]) {
     match conn.dgram_send(&datagram) {
         Ok(()) => log::debug!("-> tunnel flow {flow_id}: {} bytes", data.len()),
         Err(quiche::Error::Done) => log::debug!("dgram_send dropped (queue full) flow {flow_id}"),
+        Err(quiche::Error::BufferTooShort) => log::warn!(
+            "dropping {}-byte datagram on flow {flow_id}: exceeds writable QUIC \
+             datagram ({:?}B). The inner payload is too large for the \
+             client<->proxy path MTU; QUIC DATAGRAMs cannot fragment. Lower the \
+             tunnelled interface MTU or ensure the proxy path carries larger packets.",
+            datagram.len(),
+            conn.dgram_max_writable_len(),
+        ),
         Err(e) => log::debug!("dgram_send failed: {e}"),
     }
 }
