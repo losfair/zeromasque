@@ -271,7 +271,7 @@ fn recv_udp_segments(
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
     msg.msg_control = control.as_mut_ptr().cast();
-    msg.msg_controllen = control.len();
+    msg.msg_controllen = control.len() as _;
 
     let n = unsafe { libc::recvmsg(socket.as_raw_fd(), &mut msg, libc::MSG_DONTWAIT) };
     if n < 0 {
@@ -316,7 +316,7 @@ fn sendmsg_udp(
 
     if let Some(segment_size) = gso_segment_size {
         msg.msg_control = control.as_mut_ptr().cast();
-        msg.msg_controllen = control.len();
+        msg.msg_controllen = control.len() as _;
         set_udp_segment_cmsg(&mut msg, segment_size as u16);
     }
 
