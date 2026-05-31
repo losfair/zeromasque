@@ -96,6 +96,42 @@ quiche exposes no per-connection `SSL` accessor, so the client installs the ECH
 config list via a BoringSSL context info-callback that fires at handshake start -
 see `src/quic.rs` (`install_client_ech`).
 
+### Access control
+
+By default the proxy performs **no client authentication**: any peer that can
+reach it and send a CONNECT-UDP request matching the configured template path is
+granted a tunnel. (The client still authenticates the *server* via TLS unless
+`--insecure`.)
+
+A token can be embedded in the template as a lightweight shared-secret gate. The
+server admits a request only if its `:path` matches the full template literally,
+so a token placed in the literal part of the query acts as a password:
+
+```
+# server and client both configured with the same template:
+zeromasque serve  --template 'https://proxy:4433/masque?token=s3cret&h={target_host}&p={target_port}' ...
+zeromasque client --template 'https://proxy:4433/masque?token=s3cret&h={target_host}&p={target_port}' ...
+```
+
+A client sending the wrong token (or none) is rejected with `404`. The token is
+not exposed to passive on-path observers — the `:path` travels inside the
+encrypted QUIC/HTTP3 stream (and ECH hides the SNI) — so this is enough to keep
+opportunistic scanners from using an open proxy.
+
+It is **not** real authentication, though:
+
+- It is a single static bearer secret in a URL: it can leak via logs, shell
+  history, or config files, and a *failed* attempt is logged at debug level.
+- There is no per-client identity, no selective revocation, and no rate-limiting
+  by identity — rotating means updating the server and every client at once.
+- It is replayable indefinitely by anyone who learns it, and the match is not
+  constant-time.
+
+For access control of untrusted clients, prefer a real scheme: `Proxy-Authorization`
+validated at the request layer (proper `407`, per-client tokens, secret kept out
+of the path/logs) or mTLS for cryptographic per-client identity. Neither is
+implemented yet.
+
 ## Testing
 
 Unit tests (framing, URI templates, ECH wire format, and an in-memory BoringSSL
@@ -136,6 +172,8 @@ certificate-reload check that confirms the served certificate changes.
 - This minimal server echoes a fresh fixed-length connection ID and does not
   perform QUIC Retry / stateless address validation; it is intended for trusted
   deployments and interop testing, not open-internet hardening.
+- No client authentication by default; see [Access control](#access-control) for
+  the template-token gate and its limits.
 - Unlike zeroserve, the proxy does not (yet) apply namespace/landlock sandboxing.
 - Linux gets the full feature set (io_uring + certificate hot reload). macOS/BSD
   run on the kqueue backend without hot reload; restart to rotate certificates.
