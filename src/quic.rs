@@ -108,6 +108,31 @@ pub fn build_server_config(
     Ok(config)
 }
 
+/// Common system CA bundle locations, in probe order. BoringSSL's compiled-in
+/// default paths are unreliable across distros, so we also look here.
+const CA_BUNDLE_PATHS: &[&str] = &[
+    "/etc/ssl/certs/ca-certificates.crt", // Debian/Ubuntu/Alpine
+    "/etc/pki/tls/certs/ca-bundle.crt",   // RHEL/Fedora
+    "/etc/ssl/cert.pem",                  // BSD/macOS (Homebrew)/some musl
+    "/etc/ssl/ca-bundle.pem",             // openSUSE
+];
+
+/// Load system trust anchors into the client context (best effort): BoringSSL's
+/// compiled-in default paths plus the first known CA bundle that exists.
+fn load_system_roots(builder: &mut SslContextBuilder) {
+    let _ = builder.set_default_verify_paths();
+    for path in CA_BUNDLE_PATHS {
+        if std::path::Path::new(path).exists() && builder.set_ca_file(path).is_ok() {
+            log::debug!("loaded system CA bundle {path}");
+            return;
+        }
+    }
+    log::warn!(
+        "no system CA bundle found ({CA_BUNDLE_PATHS:?}); server certificate \
+         verification may fail (use --ca or --insecure)"
+    );
+}
+
 /// How the client verifies the proxy's certificate.
 pub enum Verify {
     /// Verify against the system trust store plus an optional extra CA file.
@@ -138,6 +163,9 @@ pub fn build_client_config(
         Verify::Insecure => builder.set_verify(SslVerifyMode::NONE),
         Verify::Roots { ca_file } => {
             builder.set_verify(SslVerifyMode::PEER);
+            // BoringSSL's trust store starts empty, so without this every real
+            // server certificate fails to verify. Load the system trust anchors.
+            load_system_roots(&mut builder);
             if let Some(ca) = ca_file {
                 builder
                     .set_ca_file(ca)
