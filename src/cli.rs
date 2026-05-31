@@ -55,6 +55,13 @@ pub struct ClientArgs {
     #[arg(long)]
     pub target: String,
 
+    /// Override the proxy UDP address to connect to (`ip:port`). The template
+    /// host is still used for SNI and `:authority`; this only changes where
+    /// packets are sent. Useful when the template host resolves to an address
+    /// the proxy isn't listening on (e.g. `localhost` -> `::1`).
+    #[arg(long, value_name = "IP:PORT")]
+    pub proxy_addr: Option<SocketAddr>,
+
     /// Skip TLS certificate verification (testing only).
     #[arg(long)]
     pub insecure: bool,

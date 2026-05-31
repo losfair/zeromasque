@@ -104,6 +104,7 @@ fn client(args: ClientArgs) -> Result<()> {
         template,
         target_host,
         target_port,
+        proxy_addr: args.proxy_addr,
         verify,
         ech_config_list,
         message: args.message.into_bytes(),

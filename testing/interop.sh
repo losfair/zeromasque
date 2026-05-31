@@ -57,8 +57,11 @@ ECH_B64=$(grep -oP 'ech="\K[^"]+' "$WORK/ech.err")
   --ech-key "$WORK/ech.pem" >"$WORK/zm-ech.log" 2>&1 & PIDS+=($!)
 sleep 2
 
+# The template authority is `localhost:<port>` (so masque-go's :authority check
+# passes), but we pin the UDP connect address to 127.0.0.1 because `localhost`
+# may resolve to ::1 first while the servers bind IPv4.
 # 1. zeromasque client -> masque-go proxy
-if "$ZM" client --template "$TMPL_MG" --target 127.0.0.1:5390 --insecure --message one 2>/dev/null \
+if "$ZM" client --template "$TMPL_MG" --proxy-addr 127.0.0.1:4470 --target 127.0.0.1:5390 --insecure --message one 2>/dev/null \
    | grep -q 'echo:one'; then ok "zeromasque client -> masque-go proxy"; else bad "zeromasque client -> masque-go proxy"; fi
 
 # 2. masque-go client -> zeromasque server
@@ -66,15 +69,15 @@ if "$WORK/mg-client" "$TMPL_ZM" 127.0.0.1:5390 two 2>/dev/null | grep -q 'echo:t
   ok "masque-go client -> zeromasque server"; else bad "masque-go client -> zeromasque server"; fi
 
 # 3. zeromasque client -> zeromasque server
-if "$ZM" client --template "$TMPL_ZM" --target 127.0.0.1:5390 --insecure --message three 2>/dev/null \
+if "$ZM" client --template "$TMPL_ZM" --proxy-addr 127.0.0.1:4471 --target 127.0.0.1:5390 --insecure --message three 2>/dev/null \
    | grep -q 'echo:three'; then ok "zeromasque client -> zeromasque server"; else bad "zeromasque client -> zeromasque server"; fi
 
 # 4. zeromasque client with ECH -> zeromasque ECH server
-if "$ZM" client --template "$TMPL_ECH" --target 127.0.0.1:5390 --insecure --ech-config "$ECH_B64" \
+if "$ZM" client --template "$TMPL_ECH" --proxy-addr 127.0.0.1:4472 --target 127.0.0.1:5390 --insecure --ech-config "$ECH_B64" \
    --message four 2>/dev/null | grep -q 'echo:four'; then ok "zeromasque ECH client -> ECH server"; else bad "zeromasque ECH client -> ECH server"; fi
 
 # 5. SIGHUP cert hot reload: swap to cert-B and confirm the served fingerprint changes.
-fp() { "$ZM" client --template "$TMPL_ZM" --target 127.0.0.1:5390 --insecure --message x 2>&1 \
+fp() { "$ZM" client --template "$TMPL_ZM" --proxy-addr 127.0.0.1:4471 --target 127.0.0.1:5390 --insecure --message x 2>&1 \
        | grep -oP 'sha256: \K[0-9a-f]+' || true; }
 FP1=$(fp)
 "$WORK/gencert" "$WORK/cert.pem" "$WORK/key.pem" 2002 cert-B

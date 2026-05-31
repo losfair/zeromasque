@@ -27,6 +27,9 @@ pub struct ClientOptions {
     pub template: Template,
     pub target_host: String,
     pub target_port: u16,
+    /// Optional override for the proxy UDP address; the template host is still
+    /// used for SNI / `:authority`.
+    pub proxy_addr: Option<SocketAddr>,
     pub verify: Verify,
     pub ech_config_list: Option<Vec<u8>>,
     pub message: Vec<u8>,
@@ -38,7 +41,10 @@ pub struct ClientOptions {
 pub async fn run(opts: ClientOptions) -> Result<()> {
     let mut config = quic::build_client_config(opts.verify, opts.ech_config_list)?;
 
-    let proxy_addr = resolve_authority(&opts.template.authority)?;
+    let proxy_addr = match opts.proxy_addr {
+        Some(addr) => addr,
+        None => resolve_authority(&opts.template.authority)?,
+    };
     let server_name = host_of(&opts.template.authority);
 
     let bind: SocketAddr = if proxy_addr.is_ipv4() {
