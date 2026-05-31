@@ -9,6 +9,7 @@ mod quic;
 mod reload;
 mod rules;
 mod server;
+mod util;
 mod varint;
 
 use std::rc::Rc;
@@ -88,7 +89,7 @@ fn serve(args: ServeArgs) -> Result<()> {
         .block_on(async move {
             let socket = monoio::net::udp::UdpSocket::bind(args.addr)
                 .with_context(|| format!("binding QUIC listener {}", args.addr))?;
-            quic::enlarge_udp_buffers(std::os::fd::AsRawFd::as_raw_fd(&socket));
+            quic::enlarge_udp_buffers(&socket);
             eprintln!("zeromasque proxy listening on {} (udp)", args.addr);
 
             spawn_reload(server_config.clone(), reload_paths, blocked)?;
@@ -132,26 +133,18 @@ fn gen_ech_key(args: GenEchArgs) -> Result<()> {
 
 fn load_ech_config(args: &ClientArgs) -> Result<Option<Vec<u8>>> {
     use base64ct::{Base64, Encoding};
-    let b64 = if let Some(s) = &args.ech_config {
-        Some(s.trim().to_string())
-    } else if let Some(path) = &args.ech_config_file {
-        Some(
-            std::fs::read_to_string(path)
-                .with_context(|| format!("reading ECH config file {}", path.display()))?
-                .trim()
-                .to_string(),
-        )
-    } else {
-        None
+    // `--ech-config` and `--ech-config-file` are mutually exclusive (clap).
+    let b64 = match (&args.ech_config, &args.ech_config_file) {
+        (Some(s), _) => s.trim().to_string(),
+        (_, Some(path)) => std::fs::read_to_string(path)
+            .with_context(|| format!("reading ECH config file {}", path.display()))?
+            .trim()
+            .to_string(),
+        (None, None) => return Ok(None),
     };
-    match b64 {
-        Some(b64) => {
-            let bytes = Base64::decode_vec(&b64)
-                .map_err(|e| anyhow::anyhow!("invalid base64 ECHConfigList: {e}"))?;
-            Ok(Some(bytes))
-        }
-        None => Ok(None),
-    }
+    Base64::decode_vec(&b64)
+        .map(Some)
+        .map_err(|e| anyhow::anyhow!("invalid base64 ECHConfigList: {e}"))
 }
 
 fn init_logging() {

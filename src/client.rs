@@ -18,20 +18,9 @@ use quiche::h3::NameValue;
 
 use crate::dgram;
 use crate::endpoint::Endpoint;
-use crate::quic::{self, Verify};
+use crate::quic::{self, CAPSULE_PROTOCOL_TRUE, MAX_DATAGRAM_SIZE, Verify};
+use crate::util::{CHANNEL_CAP, RECV_BUF, hex, sleep_opt};
 
-/// Output buffer size for `conn.send()`. MUST be at least
-/// `quic::MAX_UDP_PAYLOAD` (the configured `max_send_udp_payload_size`): quiche
-/// admits a DATAGRAM into its send queue based on `dgram_max_writable_len()`,
-/// which is derived from `max_send_udp_payload_size`, but can only serialize it
-/// into a packet that fits this buffer. A buffer smaller than that lets quiche
-/// queue a datagram it can never emit — it sticks at the head of the FIFO
-/// datagram queue and silently blocks every datagram behind it forever (only a
-/// reconnect clears it). So we size the buffer to the payload ceiling.
-const MAX_DATAGRAM_SIZE: usize = quic::MAX_UDP_PAYLOAD;
-const RECV_BUF: usize = 65535;
-const CHANNEL_CAP: usize = 1024;
-const CAPSULE_PROTOCOL_TRUE: &[u8] = b"?1";
 /// Keepalive cadence; keeps the tunnel from idling out between bursts and lets a
 /// dead path be detected quickly.
 const KEEPALIVE: Duration = Duration::from_secs(1);
@@ -83,7 +72,7 @@ fn dial(p: &ConnectParams) -> Result<Dialed> {
         "[::]:0".parse().unwrap()
     };
     let socket = UdpSocket::bind(bind).context("binding client UDP socket")?;
-    quic::enlarge_udp_buffers(std::os::fd::AsRawFd::as_raw_fd(&socket));
+    quic::enlarge_udp_buffers(&socket);
     let local_addr = socket.local_addr().context("client local addr")?;
 
     let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
@@ -145,7 +134,7 @@ pub async fn run_proxy(opts: ProxyOptions) -> Result<()> {
         UdpSocket::bind(opts.listen)
             .with_context(|| format!("binding local UDP listen socket {}", opts.listen))?,
     );
-    quic::enlarge_udp_buffers(std::os::fd::AsRawFd::as_raw_fd(&*lsock));
+    quic::enlarge_udp_buffers(&*lsock);
     log::info!("local UDP proxy listening on {}", opts.listen);
 
     // The local recv task persists across reconnects, buffering datagrams that
@@ -542,21 +531,6 @@ fn resolve_authority(authority: &str) -> Result<SocketAddr> {
         .with_context(|| format!("resolving proxy authority {authority}"))?
         .next()
         .ok_or_else(|| anyhow!("no addresses for proxy authority {authority}"))
-}
-
-fn hex(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
-}
-
-async fn sleep_opt(timeout: Option<Duration>) {
-    match timeout {
-        Some(d) => monoio::time::sleep(d).await,
-        None => std::future::pending::<()>().await,
-    }
 }
 
 #[cfg(test)]

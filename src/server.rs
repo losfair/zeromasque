@@ -18,26 +18,14 @@ use monoio::net::udp::UdpSocket;
 use quiche::h3::NameValue;
 
 use crate::dgram;
-use crate::quic;
+use crate::quic::{self, CAPSULE_PROTOCOL_TRUE, MAX_DATAGRAM_SIZE};
 use crate::rules::RuleTable;
+use crate::util::{CHANNEL_CAP, RECV_BUF, hex, sleep_opt};
 
-/// Output buffer size for `conn.send()`. MUST be at least
-/// `quic::MAX_UDP_PAYLOAD` (the configured `max_send_udp_payload_size`): quiche
-/// admits a DATAGRAM into its send queue based on `dgram_max_writable_len()`,
-/// which is derived from `max_send_udp_payload_size`, but can only serialize it
-/// into a packet that fits this buffer. A buffer smaller than that lets quiche
-/// queue a datagram it can never emit — it sticks at the head of the FIFO
-/// datagram queue and silently blocks every datagram behind it forever (only a
-/// reconnect clears it). So we size the buffer to the payload ceiling.
-const MAX_DATAGRAM_SIZE: usize = quic::MAX_UDP_PAYLOAD;
-const RECV_BUF: usize = 65535;
-const CHANNEL_CAP: usize = 1024;
 /// Fixed length of the connection IDs this server issues. Short-header packets
 /// do not carry the DCID length on the wire, so the receiver must know it; we
 /// pick one length for every connection and feed it to `Header::from_slice`.
 const LOCAL_CONN_ID_LEN: usize = 16;
-/// Structured-field value `?1` (Boolean true) for the Capsule-Protocol header.
-const CAPSULE_PROTOCOL_TRUE: &[u8] = b"?1";
 /// How often to sweep flows for the per-flow idle timeout.
 const FLOW_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -682,7 +670,7 @@ fn bind_target(
     // Connect with std (synchronous, non-blocking for datagram sockets) so the
     // socket has a fixed peer, then adopt it into monoio's io_uring driver.
     let std_sock = std::net::UdpSocket::bind(bind).context("binding target UDP socket")?;
-    quic::enlarge_udp_buffers(std::os::fd::AsRawFd::as_raw_fd(&std_sock));
+    quic::enlarge_udp_buffers(&std_sock);
     #[cfg(target_os = "linux")]
     if let Some(mark) = fwmark {
         use std::os::fd::AsRawFd;
@@ -701,19 +689,7 @@ fn bind_target(
 /// Set `SO_MARK` (fwmark) on a socket. Requires `CAP_NET_ADMIN`.
 #[cfg(target_os = "linux")]
 fn set_so_mark(fd: std::os::fd::RawFd, mark: u32) -> std::io::Result<()> {
-    let rc = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_MARK,
-            &mark as *const u32 as *const libc::c_void,
-            std::mem::size_of::<u32>() as libc::socklen_t,
-        )
-    };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
+    quic::set_sockopt_int(fd, libc::SOL_SOCKET, libc::SO_MARK, mark as libc::c_int)
 }
 
 /// Transparent forwarding: send to `target` with the client's external source IP
@@ -744,26 +720,14 @@ fn bind_target_transparent(
 
     let make = |src: SocketAddr| -> std::io::Result<Socket> {
         let sock = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
-        quic::enlarge_udp_buffers(sock.as_raw_fd());
+        quic::enlarge_udp_buffers(&sock);
         // IP_TRANSPARENT must be set before bind; it requires CAP_NET_ADMIN.
-        let one: libc::c_int = 1;
         let (level, optname) = if is_v6 {
             (libc::SOL_IPV6, libc::IPV6_TRANSPARENT)
         } else {
             (libc::SOL_IP, libc::IP_TRANSPARENT)
         };
-        let rc = unsafe {
-            libc::setsockopt(
-                sock.as_raw_fd(),
-                level,
-                optname,
-                &one as *const _ as *const libc::c_void,
-                std::mem::size_of_val(&one) as libc::socklen_t,
-            )
-        };
-        if rc != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
+        quic::set_sockopt_int(sock.as_raw_fd(), level, optname, 1)?;
         if let Some(mark) = fwmark {
             set_so_mark(sock.as_raw_fd(), mark)?;
         }
@@ -802,18 +766,3 @@ fn bind_target_transparent(
     bail!("transparent proxy mode (transparent rules) is only supported on Linux")
 }
 
-async fn sleep_opt(timeout: Option<std::time::Duration>) {
-    match timeout {
-        Some(d) => monoio::time::sleep(d).await,
-        // No active timers: park "forever" until another select arm fires.
-        None => std::future::pending::<()>().await,
-    }
-}
-
-fn hex(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
-}

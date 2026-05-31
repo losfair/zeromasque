@@ -30,6 +30,21 @@ const ALPN_H3: &[&[u8]] = &[b"h3"];
 /// and warned about at the send sites. 1280-MTU inner tunnels (e.g. IPv6
 /// WireGuard) cannot go lower, so the budget has to absorb them here.
 pub(crate) const MAX_UDP_PAYLOAD: usize = 1400;
+
+/// Output buffer size for `conn.send()`. MUST be at least [`MAX_UDP_PAYLOAD`]
+/// (the configured `max_send_udp_payload_size`): quiche admits a DATAGRAM into
+/// its send queue based on `dgram_max_writable_len()` (derived from
+/// `max_send_udp_payload_size`), but can only serialize it into a packet that
+/// fits this buffer. A smaller buffer lets quiche queue a datagram it can never
+/// emit — it sticks at the head of the FIFO datagram queue and silently blocks
+/// every datagram behind it forever (only a reconnect clears it). So size the
+/// buffer to the payload ceiling.
+pub(crate) const MAX_DATAGRAM_SIZE: usize = MAX_UDP_PAYLOAD;
+
+/// Structured-field value `?1` (Boolean true) for the `capsule-protocol` header
+/// carried on every CONNECT-UDP request and response.
+pub(crate) const CAPSULE_PROTOCOL_TRUE: &[u8] = b"?1";
+
 const IDLE_TIMEOUT_MS: u64 = 10_000;
 const DGRAM_QUEUE_LEN: usize = 65536;
 
@@ -49,30 +64,44 @@ const DGRAM_QUEUE_LEN: usize = 65536;
 /// this request — operators on high-RTT links must raise them (see README).
 const SOCKET_BUFFER_BYTES: libc::c_int = 8 * 1024 * 1024;
 
-/// Enlarge a UDP socket's send and receive buffers to [`SOCKET_BUFFER_BYTES`]
-/// (best effort; failures are logged, not fatal). Call right after binding —
-/// applies to both monoio and std sockets via the raw fd.
+/// Set a C-`int`-valued socket option via `setsockopt(2)`. Shared by the buffer
+/// sizing, `SO_MARK`, and `IP_TRANSPARENT` paths.
 #[cfg(unix)]
-pub(crate) fn enlarge_udp_buffers(fd: std::os::fd::RawFd) {
+pub(crate) fn set_sockopt_int(
+    fd: std::os::fd::RawFd,
+    level: libc::c_int,
+    optname: libc::c_int,
+    value: libc::c_int,
+) -> std::io::Result<()> {
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            level,
+            optname,
+            &value as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Enlarge a UDP socket's send and receive buffers to [`SOCKET_BUFFER_BYTES`]
+/// (best effort; failures are logged, not fatal). Call right after binding.
+#[cfg(unix)]
+pub(crate) fn enlarge_udp_buffers(sock: &impl std::os::fd::AsRawFd) {
+    let fd = sock.as_raw_fd();
     for (opt, name) in [(libc::SO_RCVBUF, "SO_RCVBUF"), (libc::SO_SNDBUF, "SO_SNDBUF")] {
-        let sz = SOCKET_BUFFER_BYTES;
-        let rc = unsafe {
-            libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                opt,
-                &sz as *const libc::c_int as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            )
-        };
-        if rc != 0 {
-            log::debug!("setsockopt {name} failed: {}", std::io::Error::last_os_error());
+        if let Err(e) = set_sockopt_int(fd, libc::SOL_SOCKET, opt, SOCKET_BUFFER_BYTES) {
+            log::debug!("setsockopt {name} failed: {e}");
         }
     }
 }
 
 #[cfg(not(unix))]
-pub(crate) fn enlarge_udp_buffers(_fd: std::os::fd::RawFd) {}
+pub(crate) fn enlarge_udp_buffers(_sock: &impl std::os::fd::AsRawFd) {}
 
 /// Apply the QUIC transport parameters common to client and server.
 fn apply_transport_params(config: &mut quiche::Config) -> Result<()> {
