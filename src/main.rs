@@ -4,10 +4,10 @@ mod dgram;
 mod ech;
 #[cfg(test)]
 mod ech_test;
+mod endpoint;
 mod quic;
 mod reload;
 mod server;
-mod template;
 mod varint;
 
 use std::rc::Rc;
@@ -18,10 +18,10 @@ use monoio::{FusionDriver, RuntimeBuilder};
 
 use crate::cli::{Cli, ClientArgs, Command, GenEchArgs, ServeArgs};
 use crate::ech::key::EchKeySet;
+use crate::endpoint::Endpoint;
 use crate::quic::Verify;
 use crate::reload::{ReloadPaths, SighupBlocked, spawn_reload};
 use crate::server::{Server, ServerConfig};
-use crate::template::Template;
 
 fn main() -> Result<()> {
     init_logging();
@@ -34,7 +34,9 @@ fn main() -> Result<()> {
 }
 
 fn serve(args: ServeArgs) -> Result<()> {
-    let template = Rc::new(Template::parse(&args.template)?);
+    let endpoint = Rc::new(Endpoint::parse(&args.endpoint)?);
+    let pinned_target = resolve_host_port(&args.target)
+        .with_context(|| format!("resolving pinned target {}", args.target))?;
 
     // Build the initial config eagerly so config errors fail fast (before the
     // runtime is up). ECH keys are loaded here too.
@@ -54,6 +56,7 @@ fn serve(args: ServeArgs) -> Result<()> {
         }
         None => None,
     };
+
     let config = quic::build_server_config(&args.cert, &args.key, ech.as_ref())?;
     let server_config = Rc::new(ServerConfig {
         config: std::cell::RefCell::new(config),
@@ -76,18 +79,18 @@ fn serve(args: ServeArgs) -> Result<()> {
             let socket = monoio::net::udp::UdpSocket::bind(args.addr)
                 .with_context(|| format!("binding QUIC listener {}", args.addr))?;
             eprintln!("zeromasque proxy listening on {} (udp)", args.addr);
-            eprintln!("proxy template: {}", template.raw);
+            eprintln!("endpoint: {}", endpoint.raw);
+            eprintln!("pinned target: all flows forward to {pinned_target}");
 
             spawn_reload(server_config.clone(), reload_paths, blocked)?;
 
-            let server = Server::new(socket, server_config, template)?;
+            let server = Server::new(socket, server_config, endpoint, pinned_target)?;
             server.run().await
         })
 }
 
 fn client(args: ClientArgs) -> Result<()> {
-    let template = Template::parse(&args.template)?;
-    let (target_host, target_port) = split_host_port(&args.target)?;
+    let endpoint = Endpoint::parse(&args.endpoint)?;
 
     let verify = if args.insecure {
         Verify::Insecure
@@ -97,25 +100,21 @@ fn client(args: ClientArgs) -> Result<()> {
         }
     };
 
-    let ech_config_list = load_ech_config(&args)?;
-
-    let response_window = args.response_window();
-    let opts = client::ClientOptions {
-        template,
-        target_host,
-        target_port,
-        proxy_addr: args.proxy_addr,
-        verify,
-        ech_config_list,
-        message: args.message.into_bytes(),
-        response_window,
+    let opts = client::ProxyOptions {
+        conn: client::ConnectParams {
+            endpoint,
+            proxy_addr: args.proxy_addr,
+            verify,
+            ech_config_list: load_ech_config(&args)?,
+        },
+        listen: args.listen,
     };
 
     RuntimeBuilder::<FusionDriver>::new()
         .enable_timer()
         .build()
         .expect("failed to build monoio runtime")
-        .block_on(client::run(opts))
+        .block_on(client::run_proxy(opts))
 }
 
 fn gen_ech_key(args: GenEchArgs) -> Result<()> {
@@ -146,24 +145,13 @@ fn load_ech_config(args: &ClientArgs) -> Result<Option<Vec<u8>>> {
     }
 }
 
-fn split_host_port(s: &str) -> Result<(String, u16)> {
-    // Support host:port and [ipv6]:port.
-    if let Some(rest) = s.strip_prefix('[') {
-        let (host, port) = rest
-            .split_once("]:")
-            .ok_or_else(|| anyhow::anyhow!("invalid [ipv6]:port target: {s}"))?;
-        return Ok((
-            host.to_string(),
-            port.parse().context("parsing target port")?,
-        ));
-    }
-    let (host, port) = s
-        .rsplit_once(':')
-        .ok_or_else(|| anyhow::anyhow!("target must be host:port: {s}"))?;
-    Ok((
-        host.to_string(),
-        port.parse().context("parsing target port")?,
-    ))
+/// Resolve a `host:port` string to a single socket address.
+fn resolve_host_port(s: &str) -> Result<std::net::SocketAddr> {
+    use std::net::ToSocketAddrs;
+    s.to_socket_addrs()
+        .with_context(|| format!("resolving {s}"))?
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no addresses for {s}"))
 }
 
 fn init_logging() {

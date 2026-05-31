@@ -122,7 +122,7 @@ pub enum Verify {
 /// per-connection SSL accessor, so this is the injection point — see
 /// `quiche-client-ech-via-info-callback` memory).
 pub fn build_client_config(
-    verify: Verify,
+    verify: &Verify,
     ech_config_list: Option<Vec<u8>>,
 ) -> Result<quiche::Config> {
     let mut builder =
@@ -140,7 +140,7 @@ pub fn build_client_config(
             builder.set_verify(SslVerifyMode::PEER);
             if let Some(ca) = ca_file {
                 builder
-                    .set_ca_file(&ca)
+                    .set_ca_file(ca)
                     .with_context(|| format!("loading CA file {}", ca.display()))?;
             }
         }

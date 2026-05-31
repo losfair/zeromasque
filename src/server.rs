@@ -7,7 +7,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::net::SocketAddr;
 use std::rc::Rc;
 
 use anyhow::{Context, Result, anyhow};
@@ -17,8 +17,8 @@ use monoio::net::udp::UdpSocket;
 use quiche::h3::NameValue;
 
 use crate::dgram;
+use crate::endpoint::Endpoint;
 use crate::quic;
-use crate::template::Template;
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
 const RECV_BUF: usize = 65535;
@@ -63,7 +63,9 @@ pub struct Server {
     local_addr: SocketAddr,
     server_config: Rc<ServerConfig>,
     h3_config: quiche::h3::Config,
-    template: Rc<Template>,
+    endpoint: Rc<Endpoint>,
+    /// Every flow forwards here; the target is pinned server-side.
+    pinned_target: SocketAddr,
     /// Active connections keyed by the server-chosen SCID.
     clients: HashMap<ConnId, Client>,
     /// Maps a client's original (handshake) DCID to our SCID, so early Initial
@@ -78,7 +80,8 @@ impl Server {
     pub fn new(
         socket: UdpSocket,
         server_config: Rc<ServerConfig>,
-        template: Rc<Template>,
+        endpoint: Rc<Endpoint>,
+        pinned_target: SocketAddr,
     ) -> Result<Self> {
         let local_addr = socket.local_addr().context("reading local UDP address")?;
         let h3_config = quic::build_h3_config()?;
@@ -88,7 +91,8 @@ impl Server {
             local_addr,
             server_config,
             h3_config,
-            template,
+            endpoint,
+            pinned_target,
             clients: HashMap::new(),
             routes: HashMap::new(),
             to_client_tx,
@@ -200,7 +204,8 @@ impl Server {
             client,
             &conn_key,
             &self.h3_config,
-            &self.template,
+            &self.endpoint,
+            self.pinned_target,
             &self.to_client_tx,
         );
     }
@@ -306,7 +311,8 @@ fn process_client(
     client: &mut Client,
     conn_id: &ConnId,
     h3_config: &quiche::h3::Config,
-    template: &Template,
+    endpoint: &Endpoint,
+    pinned_target: SocketAddr,
     to_client_tx: &mpsc::Sender<ToClient>,
 ) {
     if !(client.conn.is_established() || client.conn.is_in_early_data()) {
@@ -333,7 +339,8 @@ fn process_client(
                     &mut client.flows,
                     stream_id,
                     &list,
-                    template,
+                    endpoint,
+                    pinned_target,
                     conn_id,
                     to_client_tx,
                 );
@@ -372,7 +379,8 @@ fn handle_connect_request(
     flows: &mut HashMap<u64, Flow>,
     stream_id: u64,
     headers: &[quiche::h3::Header],
-    template: &Template,
+    endpoint: &Endpoint,
+    target: SocketAddr,
     conn_id: &ConnId,
     to_client_tx: &mpsc::Sender<ToClient>,
 ) {
@@ -385,23 +393,17 @@ fn handle_connect_request(
         }
     };
 
-    let (host, port) = match template.match_path(&req.path) {
-        Ok(hp) => hp,
-        Err(e) => {
-            log::debug!("path {:?} did not match template: {e}", req.path);
-            respond_status(conn, http3, stream_id, 404);
-            return;
-        }
-    };
-
-    let target = match resolve(&host, port) {
-        Ok(addr) => addr,
-        Err(e) => {
-            log::warn!("failed to resolve target {host}:{port}: {e}");
-            respond_status(conn, http3, stream_id, 502);
-            return;
-        }
-    };
+    // The path must match the configured endpoint exactly. The forwarding
+    // target is pinned, so the client never selects a destination.
+    if !endpoint.matches(&req.path) {
+        log::debug!(
+            "path {:?} did not match endpoint {:?}",
+            req.path,
+            endpoint.path
+        );
+        respond_status(conn, http3, stream_id, 404);
+        return;
+    }
 
     let target_sock = match bind_target(target) {
         Ok(s) => s,
@@ -427,7 +429,7 @@ fn handle_connect_request(
         },
     );
 
-    log::info!("CONNECT-UDP flow {flow_id} -> {target} ({host}:{port})");
+    log::info!("CONNECT-UDP flow {flow_id} -> {target}");
 
     let response = [
         quiche::h3::Header::new(b":status", b"200"),
@@ -453,9 +455,16 @@ fn drain_client_datagrams(conn: &mut quiche::Connection, flows: &HashMap<u64, Fl
                     continue; // only raw UDP payloads are supported
                 }
                 if let Some(flow) = flows.get(&parsed.flow_id) {
+                    log::debug!(
+                        "client datagram flow {} -> target: {} bytes",
+                        parsed.flow_id,
+                        parsed.payload.len()
+                    );
                     // Drop on full: UDP is lossy by contract.
                     let mut sender = flow.to_target.clone();
                     let _ = sender.try_send(parsed.payload.to_vec());
+                } else {
+                    log::debug!("no flow for client datagram flow_id {}", parsed.flow_id);
                 }
             }
             Err(quiche::Error::Done) => break,
@@ -557,19 +566,6 @@ fn respond_status(
     if let Err(e) = http3.send_response(conn, stream_id, &headers, true) {
         log::debug!("failed to send error status {status}: {e}");
     }
-}
-
-fn resolve(host: &str, port: u16) -> Result<SocketAddr> {
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        return Ok(SocketAddr::new(ip, port));
-    }
-    // DNS fallback (blocking getaddrinfo). Targets in interop tests are IPs, so
-    // this rarely runs on the hot path.
-    (host, port)
-        .to_socket_addrs()
-        .with_context(|| format!("resolving {host}:{port}"))?
-        .next()
-        .ok_or_else(|| anyhow!("no addresses for {host}:{port}"))
 }
 
 fn bind_target(target: SocketAddr) -> Result<UdpSocket> {

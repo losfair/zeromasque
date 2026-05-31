@@ -1,6 +1,5 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 
@@ -27,10 +26,11 @@ pub struct ServeArgs {
     #[arg(long, default_value = "0.0.0.0:4433")]
     pub addr: SocketAddr,
 
-    /// Proxy URI template, e.g.
-    /// `https://localhost:4433/masque?h={target_host}&p={target_port}`.
+    /// Proxy endpoint URI the client requests, e.g.
+    /// `https://localhost:4433/connect`. A fixed path (no target variables); a
+    /// secret may be embedded in the path/query as an admission gate.
     #[arg(long)]
-    pub template: String,
+    pub endpoint: String,
 
     /// TLS certificate chain (PEM).
     #[arg(long)]
@@ -43,17 +43,24 @@ pub struct ServeArgs {
     /// Path to an ECH key file or directory (enables server-side ECH).
     #[arg(long, value_name = "PATH")]
     pub ech_key: Option<PathBuf>,
+
+    /// Pinned forwarding target `host:port`. Every CONNECT-UDP flow is forwarded
+    /// here; the client cannot select a destination.
+    #[arg(long, value_name = "HOST:PORT")]
+    pub target: String,
 }
 
 #[derive(Parser, Debug)]
 pub struct ClientArgs {
-    /// Proxy URI template, same form the server is configured with.
+    /// Proxy endpoint URI, identical to the server's `--endpoint`.
     #[arg(long)]
-    pub template: String,
+    pub endpoint: String,
 
-    /// Target to reach through the proxy, as `host:port`.
-    #[arg(long)]
-    pub target: String,
+    /// Local UDP address to bind. Every datagram received here is tunnelled
+    /// through the proxy (one CONNECT-UDP flow per local source address), with
+    /// replies relayed back. The destination is whatever the server pins.
+    #[arg(long, value_name = "IP:PORT")]
+    pub listen: SocketAddr,
 
     /// Override the proxy UDP address to connect to (`ip:port`). The template
     /// host is still used for SNI and `:authority`; this only changes where
@@ -78,20 +85,6 @@ pub struct ClientArgs {
     /// Read the ECHConfigList (base64) from a file instead of the argument.
     #[arg(long, value_name = "FILE", conflicts_with = "ech_config")]
     pub ech_config_file: Option<PathBuf>,
-
-    /// Message to tunnel to the target.
-    #[arg(long, default_value = "ping")]
-    pub message: String,
-
-    /// How long to wait for tunnelled responses, in milliseconds.
-    #[arg(long, default_value_t = 5000)]
-    pub response_window_ms: u64,
-}
-
-impl ClientArgs {
-    pub fn response_window(&self) -> Duration {
-        Duration::from_millis(self.response_window_ms)
-    }
 }
 
 #[derive(Parser, Debug)]

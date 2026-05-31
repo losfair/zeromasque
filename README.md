@@ -23,29 +23,48 @@ cargo build --release
 The first build compiles BoringSSL from source (via `boring-sys`), so it takes a
 few minutes.
 
+## Model
+
+The forwarding **target is pinned on the server** — the proxy always forwards to
+one configured `host:port`, and clients cannot choose a destination. The two ends
+agree on a fixed **endpoint** URI (no `{target_host}`/`{target_port}` variables).
+The server matches the request on the **path component only**, ignoring the query
+string, so generic MASQUE clients that carry `target_host`/`target_port` in the
+query still interoperate (the server ignores those and uses its pinned target).
+
+The **client is a local UDP proxy**: it binds a UDP socket and tunnels every
+datagram received there to the pinned target, opening one CONNECT-UDP flow per
+local source address and relaying replies back.
+
 ## Usage
 
-Run the proxy:
+Run the proxy, pinned to a target (e.g. a DNS resolver):
 
 ```
 zeromasque serve \
   --addr 0.0.0.0:4433 \
-  --template 'https://proxy.example:4433/masque?h={target_host}&p={target_port}' \
+  --endpoint 'https://proxy.example:4433/connect' \
+  --target 192.0.2.10:53 \
   --cert cert.pem --key key.pem
 ```
 
-Probe a target through a proxy (sends one UDP datagram, prints the reply):
+Run the client as a local UDP proxy on `127.0.0.1:5353`:
 
 ```
 zeromasque client \
-  --template 'https://proxy.example:4433/masque?h={target_host}&p={target_port}' \
-  --target 192.0.2.10:53 \
-  --message 'hello'
+  --endpoint 'https://proxy.example:4433/connect' \
+  --listen 127.0.0.1:5353
 ```
 
-The URI template uses the two RFC 9298 variables `{target_host}` and
-`{target_port}`. Both the query form above and the well-known path form
-(`.../.well-known/masque/udp/{target_host}/{target_port}/`) are supported.
+Anything sent to `127.0.0.1:5353` is now tunnelled to `192.0.2.10:53`:
+
+```
+dig @127.0.0.1 -p 5353 example.com
+```
+
+`--proxy-addr <ip:port>` overrides the UDP address to connect to while keeping
+the endpoint host as SNI / `:authority` (useful when the host resolves to an
+address the proxy isn't bound to, e.g. `localhost` → `::1`).
 
 ### Certificate hot reload (Linux only)
 
@@ -80,7 +99,7 @@ zeromasque serve ... --cert cert.pem --key key.pem --ech-key ech.pem
 Offer ECH from the client with the published ECHConfigList:
 
 ```
-zeromasque client ... --ech-config "AEX+DQBB...AAA="
+zeromasque client --endpoint ... --listen ... --ech-config "AEX+DQBB...AAA="
 ```
 
 Certificate coverage with ECH is subtle. When ECH is **accepted**, the
@@ -99,28 +118,28 @@ see `src/quic.rs` (`install_client_ech`).
 ### Access control
 
 By default the proxy performs **no client authentication**: any peer that can
-reach it and send a CONNECT-UDP request matching the configured template path is
-granted a tunnel. (The client still authenticates the *server* via TLS unless
-`--insecure`.)
+reach it and send a CONNECT-UDP request whose path matches the configured
+endpoint is granted a tunnel. (The client still authenticates the *server* via
+TLS unless `--insecure`.)
 
-A token can be embedded in the template as a lightweight shared-secret gate. The
-server admits a request only if its `:path` matches the full template literally,
-so a token placed in the literal part of the query acts as a password:
+A secret can be embedded in the endpoint **path** as a lightweight shared-secret
+gate. The server matches on the path component (the query string is ignored), so
+put the secret in a path segment — not the query:
 
 ```
-# server and client both configured with the same template:
-zeromasque serve  --template 'https://proxy:4433/masque?token=s3cret&h={target_host}&p={target_port}' ...
-zeromasque client --template 'https://proxy:4433/masque?token=s3cret&h={target_host}&p={target_port}' ...
+# server and client both configured with the same secret path:
+zeromasque serve  --endpoint 'https://proxy:4433/connect/s3cret-9f2c' --target ... ...
+zeromasque client --endpoint 'https://proxy:4433/connect/s3cret-9f2c' --listen ...
 ```
 
-A client sending the wrong token (or none) is rejected with `404`. The token is
-not exposed to passive on-path observers — the `:path` travels inside the
-encrypted QUIC/HTTP3 stream (and ECH hides the SNI) — so this is enough to keep
+A client requesting a different path (or none) is rejected with `404`. The path
+is not exposed to passive on-path observers — it travels inside the encrypted
+QUIC/HTTP3 stream (and ECH hides the SNI) — so this is enough to keep
 opportunistic scanners from using an open proxy.
 
 It is **not** real authentication, though:
 
-- It is a single static bearer secret in a URL: it can leak via logs, shell
+- It is a single static bearer secret in a URL path: it can leak via logs, shell
   history, or config files, and a *failed* attempt is logged at debug level.
 - There is no per-client identity, no selective revocation, and no rate-limiting
   by identity — rotating means updating the server and every client at once.
@@ -134,8 +153,8 @@ implemented yet.
 
 ## Testing
 
-Unit tests (framing, URI templates, ECH wire format, and an in-memory BoringSSL
-handshake asserting ECH is accepted on both peers):
+Unit tests (framing, endpoint matching, ECH wire format, and an in-memory
+BoringSSL handshake asserting ECH is accepted on both peers):
 
 ```
 cargo test
@@ -148,19 +167,20 @@ End-to-end interop against masque-go (needs `go` and a masque-go checkout at
 ./testing/interop.sh
 ```
 
-The harness exercises: zeromasque client -> masque-go proxy, masque-go client ->
-zeromasque server, zeromasque <-> zeromasque, an ECH variant, and a SIGHUP
-certificate-reload check that confirms the served certificate changes.
+The harness exercises: zeromasque client -> masque-go proxy, masque-go
+(variable-template) client -> zeromasque pinned server, zeromasque <-> zeromasque,
+an ECH variant, and a SIGHUP certificate-reload check that confirms the served
+certificate changes.
 
 ## Layout
 
-- `src/server.rs` - the io_uring CONNECT-UDP proxy event loop.
-- `src/client.rs` - the MASQUE client.
+- `src/server.rs` - the io_uring CONNECT-UDP proxy event loop (target pinned).
+- `src/client.rs` - the local UDP→CONNECT-UDP proxy client.
 - `src/quic.rs` - quiche transport + BoringSSL configuration, ECH install hooks.
 - `src/reload.rs` - `signalfd`-driven SIGHUP cert/ECH hot reload (Linux; a no-op
   stub elsewhere).
-- `src/template.rs`, `src/dgram.rs`, `src/varint.rs` - URI templates and HTTP/3
-  datagram / QUIC varint framing.
+- `src/endpoint.rs`, `src/dgram.rs`, `src/varint.rs` - endpoint matching and
+  HTTP/3 datagram / QUIC varint framing.
 - `src/ech/` - ECH key material: wire format, PEM key files, keygen (ported from
   zeroserve, adapted to boring 4 / `boring-sys` HPKE keygen).
 - `testing/` - interop harness and Go helpers.
@@ -172,8 +192,11 @@ certificate-reload check that confirms the served certificate changes.
 - This minimal server echoes a fresh fixed-length connection ID and does not
   perform QUIC Retry / stateless address validation; it is intended for trusted
   deployments and interop testing, not open-internet hardening.
+- The client opens one CONNECT-UDP flow per local source address (bounded by the
+  connection's stream limit) and keeps flows for the connection's lifetime; the
+  first datagram of a new flow waits one round-trip for the `200` response.
 - No client authentication by default; see [Access control](#access-control) for
-  the template-token gate and its limits.
+  the path-secret gate and its limits.
 - Unlike zeroserve, the proxy does not (yet) apply namespace/landlock sandboxing.
 - Linux gets the full feature set (io_uring + certificate hot reload). macOS/BSD
   run on the kqueue backend without hot reload; restart to rotate certificates.
