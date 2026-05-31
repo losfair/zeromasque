@@ -72,7 +72,7 @@ fn dial(p: &ConnectParams) -> Result<Dialed> {
     } else {
         "[::]:0".parse().unwrap()
     };
-    let socket = UdpSocket::bind(bind).context("binding client UDP socket")?;
+    let socket = io::bind_udp(bind).context("binding client UDP socket")?;
     quic::enlarge_udp_buffers(&socket);
     let local_addr = socket.local_addr().context("client local addr")?;
 
@@ -132,7 +132,7 @@ struct FlowState {
 /// arrive (apps retransmit lost UDP, so they self-heal).
 pub async fn run_proxy(opts: ProxyOptions) -> Result<()> {
     let lsock = Rc::new(
-        UdpSocket::bind(opts.listen)
+        io::bind_udp(opts.listen)
             .with_context(|| format!("binding local UDP listen socket {}", opts.listen))?,
     );
     quic::enlarge_udp_buffers(&*lsock);
@@ -141,7 +141,7 @@ pub async fn run_proxy(opts: ProxyOptions) -> Result<()> {
     // The local recv task persists across reconnects, buffering datagrams that
     // arrive while the tunnel is briefly down.
     let (ltx, mut lrx) = mpsc::channel(CHANNEL_CAP);
-    io::spawn_udp_recv(lsock.clone(), ltx, None);
+    io::spawn_udp_recv(lsock.clone(), ltx, None, RECV_BUF);
 
     let mut backoff = RECONNECT_MIN;
     loop {
@@ -201,7 +201,12 @@ async fn run_session(
     // `_recv_cancel` on return stops the task, so reconnect teardown stays clean.
     let (qpkt_tx, mut qpkt_rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(CHANNEL_CAP);
     let (_recv_cancel, cancel_rx) = oneshot::channel::<()>();
-    io::spawn_udp_recv(qsock.clone(), qpkt_tx, Some(cancel_rx));
+    io::spawn_udp_recv(
+        qsock.clone(),
+        qpkt_tx,
+        Some(cancel_rx),
+        quic::MAX_DATAGRAM_SIZE,
+    );
 
     loop {
         let timeout = conn.timeout();
@@ -398,7 +403,7 @@ async fn route_tunnel_datagrams(
     lsock: &UdpSocket,
     flows: &HashMap<u64, SocketAddr>,
 ) {
-    let mut dbuf = vec![0u8; RECV_BUF];
+    let mut dbuf = vec![0u8; quic::MAX_DATAGRAM_SIZE];
     loop {
         match conn.dgram_recv(&mut dbuf) {
             Ok(len) => {
@@ -410,8 +415,7 @@ async fn route_tunnel_datagrams(
                 }
                 let (flow_id, payload) = (p.flow_id, p.payload.to_vec());
                 if let Some(src) = flows.get(&flow_id) {
-                    let (res, _) = lsock.send_to(payload, *src).await;
-                    if let Err(e) = res {
+                    if let Err(e) = io::send_udp(lsock, payload, *src).await {
                         log::debug!("send to local {src} failed: {e}");
                     }
                 }

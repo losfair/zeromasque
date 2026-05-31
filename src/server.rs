@@ -104,7 +104,7 @@ impl Server {
         // Dedicated receive task: owns the recv side of the socket so it is
         // never cancelled by the main select, and forwards each datagram.
         let (pkt_tx, mut pkt_rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(CHANNEL_CAP);
-        io::spawn_udp_recv(self.socket.clone(), pkt_tx, None);
+        io::spawn_udp_recv(self.socket.clone(), pkt_tx, None, MAX_DATAGRAM_SIZE);
 
         loop {
             let timeout = self.min_timeout();
@@ -123,11 +123,12 @@ impl Server {
                     }
                 }
                 tc = self.to_client_rx.next() => {
-                    if let Some(tc) = tc { self.on_target_payload(tc); }
+                    let now = Instant::now();
+                    if let Some(tc) = tc { self.on_target_payload(tc, now); }
                     // Queue every ready target->client payload into the datagram
                     // send queue, then flush them together below.
                     while let Ok(tc) = self.to_client_rx.try_recv() {
-                        self.on_target_payload(tc);
+                        self.on_target_payload(tc, now);
                     }
                 }
                 _ = sleep_opt(timeout) => {
@@ -161,8 +162,9 @@ impl Server {
 
         // Route to an existing connection, by our (fixed-length) SCID or the
         // client's original DCID.
-        let conn_key: Scid = if let Some(scid) =
-            Scid::try_from(dcid.as_slice()).ok().filter(|s| self.clients.contains_key(s))
+        let conn_key: Scid = if let Some(scid) = Scid::try_from(dcid.as_slice())
+            .ok()
+            .filter(|s| self.clients.contains_key(s))
         {
             scid
         } else if let Some(&scid) = self.routes.get(&dcid) {
@@ -244,8 +246,7 @@ impl Server {
         match quiche::negotiate_version(&hdr.scid, &hdr.dcid, &mut out) {
             Ok(n) => {
                 out.truncate(n);
-                let (res, _) = self.socket.send_to(out, from).await;
-                if let Err(e) = res {
+                if let Err(e) = io::send_udp(&self.socket, out, from).await {
                     log::debug!("version-negotiation send failed: {e}");
                 }
             }
@@ -253,7 +254,7 @@ impl Server {
         }
     }
 
-    fn on_target_payload(&mut self, tc: ToClient) {
+    fn on_target_payload(&mut self, tc: ToClient, now: Instant) {
         if let Some(client) = self.clients.get_mut(&tc.conn_id) {
             let datagram = dgram::encode(tc.flow_id, &tc.payload);
             match client.conn.dgram_send(&datagram) {
@@ -271,7 +272,7 @@ impl Server {
             }
             // Target→client traffic keeps the flow alive.
             if let Some(flow) = client.flows.get_mut(&tc.flow_id) {
-                flow.last_activity = Instant::now();
+                flow.last_activity = now;
             }
         }
     }
@@ -487,7 +488,8 @@ fn handle_connect_request(
 
 /// Forward any queued client→target datagrams to the matching flow task.
 fn drain_client_datagrams(conn: &mut quiche::Connection, flows: &mut HashMap<u64, Flow>) {
-    let mut buf = vec![0u8; RECV_BUF];
+    let mut buf = vec![0u8; MAX_DATAGRAM_SIZE];
+    let now = Instant::now();
     loop {
         match conn.dgram_recv(&mut buf) {
             Ok(len) => {
@@ -506,7 +508,7 @@ fn drain_client_datagrams(conn: &mut quiche::Connection, flows: &mut HashMap<u64
                     // Drop on full: UDP is lossy by contract.
                     let _ = flow.to_target.try_send(parsed.payload.to_vec());
                     // Client→target traffic keeps the flow alive.
-                    flow.last_activity = Instant::now();
+                    flow.last_activity = now;
                 } else {
                     log::debug!("no flow for client datagram flow_id {}", parsed.flow_id);
                 }
@@ -529,38 +531,43 @@ async fn target_task(
     flow_id: u64,
 ) {
     loop {
-        let buf = vec![0u8; RECV_BUF];
         monoio::select! {
             maybe = from_client.next() => {
                 match maybe {
                     Some(payload) => {
-                        let (res, _) = target.send(payload).await;
-                        if let Err(e) = res {
+                        if let Err(e) = io::send_udp_connected(&target, payload).await {
                             log::debug!("send to target failed: {e}");
                         }
                     }
                     None => break, // flow closed (sender dropped)
                 }
             }
-            recv = target.recv(buf) => {
-                let (res, buf) = recv;
-                match res {
-                    Ok(n) => {
-                        let tc = ToClient {
-                            conn_id,
-                            flow_id,
-                            payload: buf[..n].to_vec(),
-                        };
-                        if to_client.try_send(tc).is_err() {
-                            // Main loop is backed up or gone; drop / detect close.
-                            if to_client.is_closed() {
-                                break;
+            ready = target.readable(false) => {
+                if let Err(e) = ready {
+                    log::debug!("target recv readiness failed: {e}");
+                    break;
+                }
+                for _ in 0..io::RECV_BATCH {
+                    match io::recv_udp_connected(&target, RECV_BUF) {
+                        Ok(buf) => {
+                            let tc = ToClient {
+                                conn_id,
+                                flow_id,
+                                payload: buf,
+                            };
+                            if to_client.try_send(tc).is_err() {
+                                // Main loop is backed up or gone; drop / detect close.
+                                if to_client.is_closed() {
+                                    return;
+                                }
                             }
                         }
-                    }
-                    Err(e) => {
-                        log::debug!("recv from target failed: {e}");
-                        break;
+                        Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock) => break,
+                        Err(e) if matches!(e.kind(), std::io::ErrorKind::Interrupted) => continue,
+                        Err(e) => {
+                            log::debug!("recv from target failed: {e}");
+                            return;
+                        }
                     }
                 }
             }
@@ -737,4 +744,3 @@ fn bind_target_transparent(
 ) -> Result<UdpSocket> {
     bail!("transparent proxy mode (transparent rules) is only supported on Linux")
 }
-

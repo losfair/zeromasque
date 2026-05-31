@@ -93,7 +93,10 @@ pub(crate) fn set_sockopt_int(
 #[cfg(unix)]
 pub(crate) fn enlarge_udp_buffers(sock: &impl std::os::fd::AsRawFd) {
     let fd = sock.as_raw_fd();
-    for (opt, name) in [(libc::SO_RCVBUF, "SO_RCVBUF"), (libc::SO_SNDBUF, "SO_SNDBUF")] {
+    for (opt, name) in [
+        (libc::SO_RCVBUF, "SO_RCVBUF"),
+        (libc::SO_SNDBUF, "SO_SNDBUF"),
+    ] {
         if let Err(e) = set_sockopt_int(fd, libc::SOL_SOCKET, opt, SOCKET_BUFFER_BYTES) {
             log::debug!("setsockopt {name} failed: {e}");
         }
@@ -102,6 +105,19 @@ pub(crate) fn enlarge_udp_buffers(sock: &impl std::os::fd::AsRawFd) {
 
 #[cfg(not(unix))]
 pub(crate) fn enlarge_udp_buffers(_sock: &impl std::os::fd::AsRawFd) {}
+
+/// Enable Linux UDP GRO on a socket, so the kernel can merge adjacent packets
+/// from the same flow. Receive code must split by the returned segment size.
+#[cfg(target_os = "linux")]
+pub(crate) fn enable_udp_gro(sock: &impl std::os::fd::AsRawFd) {
+    let fd = sock.as_raw_fd();
+    if let Err(e) = set_sockopt_int(fd, libc::SOL_UDP, libc::UDP_GRO, 1) {
+        log::debug!("setsockopt UDP_GRO failed: {e}");
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn enable_udp_gro(_sock: &impl std::os::fd::AsRawFd) {}
 
 /// Apply the QUIC transport parameters common to client and server.
 fn apply_transport_params(config: &mut quiche::Config) -> Result<()> {

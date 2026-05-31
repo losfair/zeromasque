@@ -88,7 +88,7 @@ fn serve(args: ServeArgs) -> Result<()> {
         .build()
         .expect("failed to build monoio runtime")
         .block_on(async move {
-            let socket = monoio::net::udp::UdpSocket::bind(args.addr)
+            let socket = io::bind_udp(args.addr)
                 .with_context(|| format!("binding QUIC listener {}", args.addr))?;
             quic::enlarge_udp_buffers(&socket);
             eprintln!("zeromasque proxy listening on {} (udp)", args.addr);
