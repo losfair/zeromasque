@@ -1,0 +1,36 @@
+[package]
+name = "zeromasque"
+version = "0.1.0"
+edition = "2024"
+
+[profile.release]
+panic = "abort"
+
+[[bin]]
+name = "zeromasque"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+arc-swap = "1"
+base64ct = { version = "1", features = ["alloc"] }
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
+rand = "0.8"
+futures = "0.3"
+log = "0.4"
+# quiche pins boring to ^4.3, so we use the matching boring 4.x so the ECH
+# `SslContextBuilder` we hand to quiche shares one BoringSSL ABI.
+boring = "4"
+# Raw BoringSSL FFI: boring 4's `PKey` has no X25519 `generate`, so ECH HPKE
+# keypairs are minted via `EVP_HPKE_KEY_*`. Also gives us the SSL ptr cast for
+# client-side ECH injection.
+boring-sys = "4"
+foreign-types-shared = "0.3"
+monoio = { version = "0.2", default-features = false, features = ["async-cancel", "bytes", "iouring", "poll-io", "utils", "sync", "macros"] }
+quiche = { version = "0.29", default-features = false, features = ["boringssl-boring-crate"] }
+
+[patch.crates-io]
+monoio = { git = "https://github.com/bytedance/monoio", rev = "212fde187f3d41f65ecd35b9cac80f7e246bb58e" }
+
+[dev-dependencies]

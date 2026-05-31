@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-test:
+    name: build, lint & unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build prerequisites (BoringSSL needs cmake + Go)
+        run: sudo apt-get update && sudo apt-get install -y cmake
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build
+        run: cargo build --all-targets
+
+      - name: Unit tests
+        run: cargo test
+
+  interop:
+    name: masque-go interop
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: zeromasque
+
+      - name: Check out masque-go (reference implementation)
+        uses: actions/checkout@v4
+        with:
+          repository: quic-go/masque-go
+          path: masque-go
+
+      - name: Install build prerequisites
+        run: sudo apt-get update && sudo apt-get install -y cmake
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: zeromasque
+
+      - name: Run interop matrix
+        working-directory: zeromasque
+        env:
+          MASQUE_GO: ${{ github.workspace }}/masque-go
+        run: ./testing/interop.sh

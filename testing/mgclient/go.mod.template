@@ -1,0 +1,14 @@
+// Renamed to go.mod by interop.sh, which fills in the masque-go path via a
+// `replace` directive so this stays decoupled from where masque-go is checked
+// out. Run `go mod tidy` after copying.
+module mgclient
+
+go 1.23
+
+require (
+	github.com/quic-go/masque-go v0.0.0
+	github.com/quic-go/quic-go v0.55.0
+	github.com/yosida95/uritemplate/v3 v3.0.2
+)
+
+replace github.com/quic-go/masque-go => MASQUE_GO_PATH
