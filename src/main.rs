@@ -38,11 +38,11 @@ fn serve(args: ServeArgs) -> Result<()> {
     let rule_table = rules::RuleTable::load(&args.rules)
         .with_context(|| format!("loading rule table {}", args.rules.display()))?;
     eprintln!("loaded {} forwarding rule(s)", rule_table.len());
-    let transparent = rule_table.transparent_count();
-    if transparent > 0 {
+    let privileged = rule_table.privileged_count();
+    if privileged > 0 {
         eprintln!(
-            "{transparent} transparent rule(s): forwarding preserves the client source IP \
-             (needs CAP_NET_ADMIN; replies to the spoofed source must route back to the proxy)"
+            "{privileged} rule(s) use transparent forwarding and/or fwmark; these need \
+             CAP_NET_ADMIN (transparent also requires routing the target's replies back)"
         );
     }
 

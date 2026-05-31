@@ -93,6 +93,13 @@ the target is a local service. The source port is the client's QUIC port where
 free, else an ephemeral port on the same IP (a client multiplexes many flows over
 one address). Non-transparent rules use an ordinary ephemeral source.
 
+A rule may also set `"fwmark": N` to apply `SO_MARK` to the target socket (Linux,
+needs `CAP_NET_ADMIN`), e.g. to drive policy routing for the reply path:
+
+```json
+[{"endpoint": "https://proxy:4433/dns", "target": "127.0.0.1:53", "transparent": true, "fwmark": 100}]
+```
+
 ### Hot reload (Linux only)
 
 Send `SIGHUP` to rebuild the TLS/ECH configuration *and* the rule table from

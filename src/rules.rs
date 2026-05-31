@@ -29,12 +29,16 @@ struct RuleSpec {
     /// (`IP_TRANSPARENT`). See `RuleMatch`.
     #[serde(default)]
     transparent: bool,
+    /// Linux only: set `SO_MARK` (fwmark) on the target socket for policy routing.
+    #[serde(default)]
+    fwmark: Option<u32>,
 }
 
 struct Rule {
     endpoint: Endpoint,
     target: SocketAddr,
     transparent: bool,
+    fwmark: Option<u32>,
 }
 
 /// The forwarding decision for a matched request.
@@ -44,6 +48,8 @@ pub struct RuleMatch {
     /// When set, forward to the target with the client's external source IP
     /// preserved via `IP_TRANSPARENT` (Linux only).
     pub transparent: bool,
+    /// When set, the fwmark to apply to the target socket via `SO_MARK` (Linux).
+    pub fwmark: Option<u32>,
 }
 
 /// A loaded, validated rule table.
@@ -70,6 +76,7 @@ impl RuleTable {
                 endpoint,
                 target,
                 transparent: spec.transparent,
+                fwmark: spec.fwmark,
             });
         }
         Ok(Self { rules })
@@ -84,6 +91,7 @@ impl RuleTable {
             .map(|r| RuleMatch {
                 target: r.target,
                 transparent: r.transparent,
+                fwmark: r.fwmark,
             })
     }
 
@@ -91,9 +99,12 @@ impl RuleTable {
         self.rules.len()
     }
 
-    /// Number of rules requesting transparent forwarding.
-    pub fn transparent_count(&self) -> usize {
-        self.rules.iter().filter(|r| r.transparent).count()
+    /// Number of rules needing `CAP_NET_ADMIN` (transparent forwarding or fwmark).
+    pub fn privileged_count(&self) -> usize {
+        self.rules
+            .iter()
+            .filter(|r| r.transparent || r.fwmark.is_some())
+            .count()
     }
 }
 
@@ -155,18 +166,22 @@ mod tests {
     }
 
     #[test]
-    fn transparent_defaults_off_and_parses_when_set() {
+    fn transparent_and_fwmark_parse() {
         let p = write_temp(
-            "transparent",
+            "flags",
             r#"[
-              {"endpoint":"https://a/x","target":"127.0.0.1:1","transparent":true},
+              {"endpoint":"https://a/x","target":"127.0.0.1:1","transparent":true,"fwmark":7},
               {"endpoint":"https://b/y","target":"127.0.0.1:2"}
             ]"#,
         );
         let t = RuleTable::load(&p).unwrap();
-        assert!(t.match_target("a", "/x").unwrap().transparent);
-        assert!(!t.match_target("b", "/y").unwrap().transparent);
-        assert_eq!(t.transparent_count(), 1);
+        let a = t.match_target("a", "/x").unwrap();
+        assert!(a.transparent);
+        assert_eq!(a.fwmark, Some(7));
+        let b = t.match_target("b", "/y").unwrap();
+        assert!(!b.transparent);
+        assert_eq!(b.fwmark, None);
+        assert_eq!(t.privileged_count(), 1);
         let _ = std::fs::remove_file(&p);
     }
 

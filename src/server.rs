@@ -406,7 +406,7 @@ fn handle_connect_request(
         }
     };
 
-    let target_sock = match bind_target(rule.target, client_addr, rule.transparent) {
+    let target_sock = match bind_target(rule.target, client_addr, rule.transparent, rule.fwmark) {
         Ok(s) => s,
         Err(e) => {
             log::warn!("failed to open target socket for {}: {e}", rule.target);
@@ -430,15 +430,14 @@ fn handle_connect_request(
         },
     );
 
+    let mut extra = String::new();
     if rule.transparent {
-        log::info!(
-            "CONNECT-UDP flow {flow_id} -> {} (transparent, src {})",
-            rule.target,
-            client_addr.ip()
-        );
-    } else {
-        log::info!("CONNECT-UDP flow {flow_id} -> {}", rule.target);
+        extra.push_str(&format!(" transparent src {}", client_addr.ip()));
     }
+    if let Some(mark) = rule.fwmark {
+        extra.push_str(&format!(" fwmark {mark}"));
+    }
+    log::info!("CONNECT-UDP flow {flow_id} -> {}{extra}", rule.target);
 
     let response = [
         quiche::h3::Header::new(b":status", b"200"),
@@ -585,13 +584,19 @@ fn respond_status(
 /// Open the UDP socket used to relay one flow to its target. In transparent mode
 /// (Linux only) the socket forwards with the client's external source IP
 /// preserved via `IP_TRANSPARENT`; otherwise it uses an ephemeral local source.
+/// `fwmark`, when set, applies `SO_MARK` for policy routing (Linux only).
 fn bind_target(
     target: SocketAddr,
     client_addr: SocketAddr,
     transparent: bool,
+    fwmark: Option<u32>,
 ) -> Result<UdpSocket> {
     if transparent {
-        return bind_target_transparent(target, client_addr);
+        return bind_target_transparent(target, client_addr, fwmark);
+    }
+    #[cfg(not(target_os = "linux"))]
+    if fwmark.is_some() {
+        bail!("fwmark is only supported on Linux");
     }
     let bind: SocketAddr = if target.is_ipv4() {
         "0.0.0.0:0".parse().unwrap()
@@ -601,6 +606,12 @@ fn bind_target(
     // Connect with std (synchronous, non-blocking for datagram sockets) so the
     // socket has a fixed peer, then adopt it into monoio's io_uring driver.
     let std_sock = std::net::UdpSocket::bind(bind).context("binding target UDP socket")?;
+    #[cfg(target_os = "linux")]
+    if let Some(mark) = fwmark {
+        use std::os::fd::AsRawFd;
+        set_so_mark(std_sock.as_raw_fd(), mark)
+            .with_context(|| format!("setting fwmark {mark} (needs CAP_NET_ADMIN)"))?;
+    }
     std_sock
         .connect(target)
         .context("connecting target socket")?;
@@ -610,6 +621,24 @@ fn bind_target(
     UdpSocket::from_std(std_sock).context("adopting target socket into monoio")
 }
 
+/// Set `SO_MARK` (fwmark) on a socket. Requires `CAP_NET_ADMIN`.
+#[cfg(target_os = "linux")]
+fn set_so_mark(fd: std::os::fd::RawFd, mark: u32) -> std::io::Result<()> {
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_MARK,
+            &mark as *const u32 as *const libc::c_void,
+            std::mem::size_of::<u32>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Transparent forwarding: send to `target` with the client's external source IP
 /// preserved (`IP_TRANSPARENT`). Tries the client's exact `ip:port`, falling back
 /// to an ephemeral port on that IP if it's already in use (a client multiplexes
@@ -617,7 +646,11 @@ fn bind_target(
 /// also route the target's replies (to the spoofed source) back to the proxy,
 /// which is straightforward for a local target.
 #[cfg(target_os = "linux")]
-fn bind_target_transparent(target: SocketAddr, client_addr: SocketAddr) -> Result<UdpSocket> {
+fn bind_target_transparent(
+    target: SocketAddr,
+    client_addr: SocketAddr,
+    fwmark: Option<u32>,
+) -> Result<UdpSocket> {
     use socket2::{Domain, Protocol, Socket, Type};
     use std::os::fd::AsRawFd;
 
@@ -653,6 +686,9 @@ fn bind_target_transparent(target: SocketAddr, client_addr: SocketAddr) -> Resul
         if rc != 0 {
             return Err(std::io::Error::last_os_error());
         }
+        if let Some(mark) = fwmark {
+            set_so_mark(sock.as_raw_fd(), mark)?;
+        }
         sock.set_reuse_address(true)?;
         sock.bind(&src.into())?;
         sock.connect(&target.into())?;
@@ -680,7 +716,11 @@ fn bind_target_transparent(target: SocketAddr, client_addr: SocketAddr) -> Resul
 }
 
 #[cfg(not(target_os = "linux"))]
-fn bind_target_transparent(_target: SocketAddr, _client_addr: SocketAddr) -> Result<UdpSocket> {
+fn bind_target_transparent(
+    _target: SocketAddr,
+    _client_addr: SocketAddr,
+    _fwmark: Option<u32>,
+) -> Result<UdpSocket> {
     bail!("transparent proxy mode (transparent rules) is only supported on Linux")
 }
 
