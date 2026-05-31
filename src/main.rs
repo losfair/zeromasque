@@ -38,6 +38,13 @@ fn serve(args: ServeArgs) -> Result<()> {
     let rule_table = rules::RuleTable::load(&args.rules)
         .with_context(|| format!("loading rule table {}", args.rules.display()))?;
     eprintln!("loaded {} forwarding rule(s)", rule_table.len());
+    let transparent = rule_table.transparent_count();
+    if transparent > 0 {
+        eprintln!(
+            "{transparent} transparent rule(s): forwarding preserves the client source IP \
+             (needs CAP_NET_ADMIN; replies to the spoofed source must route back to the proxy)"
+        );
+    }
 
     // Build the initial config eagerly so config errors fail fast (before the
     // runtime is up). ECH keys are loaded here too.

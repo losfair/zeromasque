@@ -25,11 +25,25 @@ use crate::endpoint::Endpoint;
 struct RuleSpec {
     endpoint: String,
     target: String,
+    /// Linux only: forward with the client's external source address preserved
+    /// (`IP_TRANSPARENT`). See `RuleMatch`.
+    #[serde(default)]
+    transparent: bool,
 }
 
 struct Rule {
     endpoint: Endpoint,
     target: SocketAddr,
+    transparent: bool,
+}
+
+/// The forwarding decision for a matched request.
+#[derive(Clone, Copy)]
+pub struct RuleMatch {
+    pub target: SocketAddr,
+    /// When set, forward to the target with the client's external source IP
+    /// preserved via `IP_TRANSPARENT` (Linux only).
+    pub transparent: bool,
 }
 
 /// A loaded, validated rule table.
@@ -52,22 +66,34 @@ impl RuleTable {
                 .with_context(|| format!("rule endpoint {:?}", spec.endpoint))?;
             let target =
                 resolve(&spec.target).with_context(|| format!("rule target {:?}", spec.target))?;
-            rules.push(Rule { endpoint, target });
+            rules.push(Rule {
+                endpoint,
+                target,
+                transparent: spec.transparent,
+            });
         }
         Ok(Self { rules })
     }
 
-    /// The pinned target for a request `:authority` + `:path`, or `None` if no
-    /// rule matches.
-    pub fn match_target(&self, authority: &str, path: &str) -> Option<SocketAddr> {
+    /// The forwarding decision for a request `:authority` + `:path`, or `None`
+    /// if no rule matches.
+    pub fn match_target(&self, authority: &str, path: &str) -> Option<RuleMatch> {
         self.rules
             .iter()
             .find(|r| r.endpoint.authority == authority && r.endpoint.matches(path))
-            .map(|r| r.target)
+            .map(|r| RuleMatch {
+                target: r.target,
+                transparent: r.transparent,
+            })
     }
 
     pub fn len(&self) -> usize {
         self.rules.len()
+    }
+
+    /// Number of rules requesting transparent forwarding.
+    pub fn transparent_count(&self) -> usize {
+        self.rules.iter().filter(|r| r.transparent).count()
     }
 }
 
@@ -93,6 +119,10 @@ mod tests {
         p
     }
 
+    fn target(t: &RuleTable, authority: &str, path: &str) -> Option<SocketAddr> {
+        t.match_target(authority, path).map(|m| m.target)
+    }
+
     #[test]
     fn matches_authority_and_path_ignoring_query() {
         let p = write_temp(
@@ -105,22 +135,38 @@ mod tests {
         let t = RuleTable::load(&p).unwrap();
         assert_eq!(t.len(), 2);
         assert_eq!(
-            t.match_target("a.example.com", "/masque"),
-            Some("127.0.0.1:1234".parse().unwrap())
+            target(&t, "a.example.com", "/masque"),
+            "127.0.0.1:1234".parse().ok()
         );
         // Query is ignored on the path match.
         assert_eq!(
-            t.match_target("a.example.com", "/masque?h=1.2.3.4&p=53"),
-            Some("127.0.0.1:1234".parse().unwrap())
+            target(&t, "a.example.com", "/masque?h=1.2.3.4&p=53"),
+            "127.0.0.1:1234".parse().ok()
         );
         assert_eq!(
-            t.match_target("b.example.com", "/connect"),
-            Some("127.0.0.1:5678".parse().unwrap())
+            target(&t, "b.example.com", "/connect"),
+            "127.0.0.1:5678".parse().ok()
         );
         // Right path, wrong host -> no match.
-        assert_eq!(t.match_target("b.example.com", "/masque"), None);
+        assert_eq!(target(&t, "b.example.com", "/masque"), None);
         // Right host, wrong path -> no match.
-        assert_eq!(t.match_target("a.example.com", "/other"), None);
+        assert_eq!(target(&t, "a.example.com", "/other"), None);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn transparent_defaults_off_and_parses_when_set() {
+        let p = write_temp(
+            "transparent",
+            r#"[
+              {"endpoint":"https://a/x","target":"127.0.0.1:1","transparent":true},
+              {"endpoint":"https://b/y","target":"127.0.0.1:2"}
+            ]"#,
+        );
+        let t = RuleTable::load(&p).unwrap();
+        assert!(t.match_target("a", "/x").unwrap().transparent);
+        assert!(!t.match_target("b", "/y").unwrap().transparent);
+        assert_eq!(t.transparent_count(), 1);
         let _ = std::fs::remove_file(&p);
     }
 

@@ -73,6 +73,26 @@ dig @127.0.0.1 -p 5353 example.com
 the endpoint host as SNI / `:authority` (useful when the host resolves to an
 address the proxy isn't bound to, e.g. `localhost` → `::1`).
 
+The client verifies the proxy's certificate against the system trust store by
+default; pass `--ca <pem>` to add a CA, or `--insecure` to skip verification
+(testing only).
+
+### Transparent forwarding (Linux only)
+
+A rule with `"transparent": true` forwards to its target with the client's
+**external source IP preserved** via `IP_TRANSPARENT`, so a local target service
+sees traffic as coming from the real client rather than the proxy:
+
+```json
+[{"endpoint": "https://proxy:4433/dns", "target": "127.0.0.1:53", "transparent": true}]
+```
+
+This requires `CAP_NET_ADMIN`, and the operator must route the target's replies
+(addressed to the spoofed client source) back to the proxy — straightforward when
+the target is a local service. The source port is the client's QUIC port where
+free, else an ephemeral port on the same IP (a client multiplexes many flows over
+one address). Non-transparent rules use an ordinary ephemeral source.
+
 ### Hot reload (Linux only)
 
 Send `SIGHUP` to rebuild the TLS/ECH configuration *and* the rule table from

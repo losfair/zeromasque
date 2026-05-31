@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::rc::Rc;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use futures::StreamExt;
 use futures::channel::mpsc;
 use monoio::net::udp::UdpSocket;
@@ -308,6 +308,9 @@ fn process_client(
     if !(client.conn.is_established() || client.conn.is_in_early_data()) {
         return;
     }
+    // The client's external address — used as the preserved source for
+    // transparent rules.
+    let client_addr = client.peer;
     if client.http3.is_none() {
         match quiche::h3::Connection::with_transport(&mut client.conn, h3_config) {
             Ok(h3) => client.http3 = Some(h3),
@@ -330,6 +333,7 @@ fn process_client(
                     stream_id,
                     &list,
                     server_config,
+                    client_addr,
                     conn_id,
                     to_client_tx,
                 );
@@ -369,6 +373,7 @@ fn handle_connect_request(
     stream_id: u64,
     headers: &[quiche::h3::Header],
     server_config: &ServerConfig,
+    client_addr: SocketAddr,
     conn_id: &ConnId,
     to_client_tx: &mpsc::Sender<ToClient>,
 ) {
@@ -381,15 +386,15 @@ fn handle_connect_request(
         }
     };
 
-    // Look up the pinned target for this request's authority + path in the rule
-    // table. The borrow is released immediately (the target is `Copy`). The
-    // client never selects a destination.
-    let target = match server_config
+    // Look up the forwarding rule for this request's authority + path. The
+    // borrow is released immediately (`RuleMatch` is `Copy`). The client never
+    // selects a destination.
+    let rule = match server_config
         .rules
         .borrow()
         .match_target(&req.authority, &req.path)
     {
-        Some(target) => target,
+        Some(rule) => rule,
         None => {
             log::debug!(
                 "no rule for authority {:?} path {:?}",
@@ -401,10 +406,10 @@ fn handle_connect_request(
         }
     };
 
-    let target_sock = match bind_target(target) {
+    let target_sock = match bind_target(rule.target, client_addr, rule.transparent) {
         Ok(s) => s,
         Err(e) => {
-            log::warn!("failed to open target socket for {target}: {e}");
+            log::warn!("failed to open target socket for {}: {e}", rule.target);
             respond_status(conn, http3, stream_id, 502);
             return;
         }
@@ -425,7 +430,15 @@ fn handle_connect_request(
         },
     );
 
-    log::info!("CONNECT-UDP flow {flow_id} -> {target}");
+    if rule.transparent {
+        log::info!(
+            "CONNECT-UDP flow {flow_id} -> {} (transparent, src {})",
+            rule.target,
+            client_addr.ip()
+        );
+    } else {
+        log::info!("CONNECT-UDP flow {flow_id} -> {}", rule.target);
+    }
 
     let response = [
         quiche::h3::Header::new(b":status", b"200"),
@@ -569,7 +582,17 @@ fn respond_status(
     }
 }
 
-fn bind_target(target: SocketAddr) -> Result<UdpSocket> {
+/// Open the UDP socket used to relay one flow to its target. In transparent mode
+/// (Linux only) the socket forwards with the client's external source IP
+/// preserved via `IP_TRANSPARENT`; otherwise it uses an ephemeral local source.
+fn bind_target(
+    target: SocketAddr,
+    client_addr: SocketAddr,
+    transparent: bool,
+) -> Result<UdpSocket> {
+    if transparent {
+        return bind_target_transparent(target, client_addr);
+    }
     let bind: SocketAddr = if target.is_ipv4() {
         "0.0.0.0:0".parse().unwrap()
     } else {
@@ -585,6 +608,80 @@ fn bind_target(target: SocketAddr) -> Result<UdpSocket> {
         .set_nonblocking(true)
         .context("set target nonblocking")?;
     UdpSocket::from_std(std_sock).context("adopting target socket into monoio")
+}
+
+/// Transparent forwarding: send to `target` with the client's external source IP
+/// preserved (`IP_TRANSPARENT`). Tries the client's exact `ip:port`, falling back
+/// to an ephemeral port on that IP if it's already in use (a client multiplexes
+/// many flows over one QUIC address). Requires `CAP_NET_ADMIN`; the operator must
+/// also route the target's replies (to the spoofed source) back to the proxy,
+/// which is straightforward for a local target.
+#[cfg(target_os = "linux")]
+fn bind_target_transparent(target: SocketAddr, client_addr: SocketAddr) -> Result<UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    use std::os::fd::AsRawFd;
+
+    // Source and target must share an address family. Canonicalise so an
+    // IPv4-mapped IPv6 client address (dual-stack listener) compares as IPv4.
+    let src_ip = client_addr.ip().to_canonical();
+    let (domain, is_v6) = match (src_ip.is_ipv4(), target.is_ipv4()) {
+        (true, true) => (Domain::IPV4, false),
+        (false, false) => (Domain::IPV6, true),
+        _ => bail!(
+            "transparent rule: client {client_addr} and target {target} address families differ"
+        ),
+    };
+
+    let make = |src: SocketAddr| -> std::io::Result<Socket> {
+        let sock = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+        // IP_TRANSPARENT must be set before bind; it requires CAP_NET_ADMIN.
+        let one: libc::c_int = 1;
+        let (level, optname) = if is_v6 {
+            (libc::SOL_IPV6, libc::IPV6_TRANSPARENT)
+        } else {
+            (libc::SOL_IP, libc::IP_TRANSPARENT)
+        };
+        let rc = unsafe {
+            libc::setsockopt(
+                sock.as_raw_fd(),
+                level,
+                optname,
+                &one as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&one) as libc::socklen_t,
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        sock.set_reuse_address(true)?;
+        sock.bind(&src.into())?;
+        sock.connect(&target.into())?;
+        sock.set_nonblocking(true)?;
+        Ok(sock)
+    };
+
+    let exact = SocketAddr::new(src_ip, client_addr.port());
+    let sock = match make(exact) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            log::debug!("transparent source {exact} busy; using ephemeral port");
+            make(SocketAddr::new(src_ip, 0)).map_err(|e| {
+                anyhow!("transparent bind to {src_ip} failed: {e} (needs CAP_NET_ADMIN)")
+            })?
+        }
+        Err(e) => {
+            return Err(anyhow!(
+                "transparent bind to {exact} failed: {e} (transparent rules need CAP_NET_ADMIN)"
+            ));
+        }
+    };
+
+    UdpSocket::from_std(sock.into()).context("adopting transparent target socket into monoio")
+}
+
+#[cfg(not(target_os = "linux"))]
+fn bind_target_transparent(_target: SocketAddr, _client_addr: SocketAddr) -> Result<UdpSocket> {
+    bail!("transparent proxy mode (transparent rules) is only supported on Linux")
 }
 
 async fn sleep_opt(timeout: Option<std::time::Duration>) {
