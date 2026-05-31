@@ -42,9 +42,14 @@ Write a rule table (`rules.json`) mapping endpoints to pinned targets:
 ```json
 [
   {"endpoint": "https://dns.example:4433/connect", "target": "192.0.2.10:53"},
-  {"endpoint": "https://ntp.example:4433/connect", "target": "192.0.2.20:123"}
+  {"endpoint": "https://ntp.example:4433/connect", "target": "192.0.2.20:123", "idle_timeout": 60}
 ]
 ```
+
+Each rule may set `"idle_timeout": N` (seconds, default `35`, `0` disables it): the
+server closes a tunnelled UDP flow that has had no traffic in either direction for
+that long. A later datagram from the same local source simply reopens a fresh
+flow, so this bounds per-flow sockets/tasks and frees QUIC streams for reuse.
 
 Run the proxy:
 

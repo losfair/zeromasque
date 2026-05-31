@@ -9,6 +9,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use futures::StreamExt;
@@ -29,6 +30,8 @@ const CHANNEL_CAP: usize = 1024;
 const LOCAL_CONN_ID_LEN: usize = 16;
 /// Structured-field value `?1` (Boolean true) for the Capsule-Protocol header.
 const CAPSULE_PROTOCOL_TRUE: &[u8] = b"?1";
+/// How often to sweep flows for the per-flow idle timeout.
+const FLOW_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 
 type ConnId = Vec<u8>;
 
@@ -39,9 +42,14 @@ struct ToClient {
     payload: Vec<u8>,
 }
 
-/// One active CONNECT-UDP flow: the channel feeding its target socket task.
+/// One active CONNECT-UDP flow: the channel feeding its target socket task plus
+/// idle-timeout bookkeeping.
 struct Flow {
     to_target: mpsc::Sender<Vec<u8>>,
+    /// Last time a datagram crossed this flow in either direction.
+    last_activity: Instant,
+    /// Idle timeout; `None` disables it. From the matching rule.
+    idle_timeout: Option<Duration>,
 }
 
 struct Client {
@@ -133,6 +141,9 @@ impl Server {
                     for client in self.clients.values_mut() {
                         client.conn.on_timeout();
                     }
+                }
+                _ = monoio::time::sleep(FLOW_SWEEP_INTERVAL) => {
+                    self.sweep_idle_flows();
                 }
             }
             self.flush_all().await;
@@ -254,6 +265,10 @@ impl Server {
                 Ok(()) | Err(quiche::Error::Done) => {}
                 Err(e) => log::debug!("dgram_send to client failed: {e}"),
             }
+            // Target→client traffic keeps the flow alive.
+            if let Some(flow) = client.flows.get_mut(&tc.flow_id) {
+                flow.last_activity = Instant::now();
+            }
         }
     }
 
@@ -293,6 +308,35 @@ impl Server {
                 true
             }
         });
+    }
+
+    /// Close flows idle past their per-rule timeout. Removing a flow drops the
+    /// channel to its target task (which then exits, closing the target socket),
+    /// and resetting the request stream tells the client the flow is gone (so it
+    /// frees the QUIC stream and reopens lazily on the next datagram).
+    fn sweep_idle_flows(&mut self) {
+        let now = Instant::now();
+        for client in self.clients.values_mut() {
+            let expired: Vec<u64> = client
+                .flows
+                .iter()
+                .filter_map(|(flow_id, flow)| {
+                    let d = flow.idle_timeout?;
+                    (now.duration_since(flow.last_activity) >= d).then_some(*flow_id)
+                })
+                .collect();
+            for flow_id in expired {
+                client.flows.remove(&flow_id);
+                let stream_id = flow_id * 4;
+                let _ = client
+                    .conn
+                    .stream_shutdown(stream_id, quiche::Shutdown::Write, 0x100);
+                let _ = client
+                    .conn
+                    .stream_shutdown(stream_id, quiche::Shutdown::Read, 0x100);
+                log::info!("flow {flow_id} idle-timed-out; closed");
+            }
+        }
     }
 }
 
@@ -362,7 +406,7 @@ fn process_client(
         }
     }
 
-    drain_client_datagrams(&mut client.conn, &client.flows);
+    drain_client_datagrams(&mut client.conn, &mut client.flows);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -427,6 +471,8 @@ fn handle_connect_request(
         flow_id,
         Flow {
             to_target: to_target_tx,
+            last_activity: Instant::now(),
+            idle_timeout: rule.idle_timeout,
         },
     );
 
@@ -451,7 +497,7 @@ fn handle_connect_request(
 }
 
 /// Forward any queued client→target datagrams to the matching flow task.
-fn drain_client_datagrams(conn: &mut quiche::Connection, flows: &HashMap<u64, Flow>) {
+fn drain_client_datagrams(conn: &mut quiche::Connection, flows: &mut HashMap<u64, Flow>) {
     let mut buf = vec![0u8; RECV_BUF];
     loop {
         match conn.dgram_recv(&mut buf) {
@@ -462,15 +508,16 @@ fn drain_client_datagrams(conn: &mut quiche::Connection, flows: &HashMap<u64, Fl
                 if parsed.context_id != dgram::CONTEXT_ID_UDP {
                     continue; // only raw UDP payloads are supported
                 }
-                if let Some(flow) = flows.get(&parsed.flow_id) {
+                if let Some(flow) = flows.get_mut(&parsed.flow_id) {
                     log::debug!(
                         "client datagram flow {} -> target: {} bytes",
                         parsed.flow_id,
                         parsed.payload.len()
                     );
                     // Drop on full: UDP is lossy by contract.
-                    let mut sender = flow.to_target.clone();
-                    let _ = sender.try_send(parsed.payload.to_vec());
+                    let _ = flow.to_target.try_send(parsed.payload.to_vec());
+                    // Client→target traffic keeps the flow alive.
+                    flow.last_activity = Instant::now();
                 } else {
                     log::debug!("no flow for client datagram flow_id {}", parsed.flow_id);
                 }

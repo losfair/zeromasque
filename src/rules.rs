@@ -15,11 +15,17 @@
 
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 
 use crate::endpoint::Endpoint;
+
+/// Default per-flow idle timeout (seconds) when a rule doesn't specify one.
+fn default_idle_secs() -> u64 {
+    35
+}
 
 #[derive(Deserialize)]
 struct RuleSpec {
@@ -32,6 +38,9 @@ struct RuleSpec {
     /// Linux only: set `SO_MARK` (fwmark) on the target socket for policy routing.
     #[serde(default)]
     fwmark: Option<u32>,
+    /// Per-flow idle timeout in seconds; `0` disables it. Defaults to 35.
+    #[serde(default = "default_idle_secs")]
+    idle_timeout: u64,
 }
 
 struct Rule {
@@ -39,6 +48,7 @@ struct Rule {
     target: SocketAddr,
     transparent: bool,
     fwmark: Option<u32>,
+    idle_timeout: Option<Duration>,
 }
 
 /// The forwarding decision for a matched request.
@@ -50,6 +60,9 @@ pub struct RuleMatch {
     pub transparent: bool,
     /// When set, the fwmark to apply to the target socket via `SO_MARK` (Linux).
     pub fwmark: Option<u32>,
+    /// Idle timeout for the flow; `None` disables it. Enforced server-side: a
+    /// flow with no traffic in either direction for this long is closed.
+    pub idle_timeout: Option<Duration>,
 }
 
 /// A loaded, validated rule table.
@@ -77,6 +90,8 @@ impl RuleTable {
                 target,
                 transparent: spec.transparent,
                 fwmark: spec.fwmark,
+                idle_timeout: (spec.idle_timeout != 0)
+                    .then(|| Duration::from_secs(spec.idle_timeout)),
             });
         }
         Ok(Self { rules })
@@ -92,6 +107,7 @@ impl RuleTable {
                 target: r.target,
                 transparent: r.transparent,
                 fwmark: r.fwmark,
+                idle_timeout: r.idle_timeout,
             })
     }
 
@@ -166,21 +182,27 @@ mod tests {
     }
 
     #[test]
-    fn transparent_and_fwmark_parse() {
+    fn transparent_fwmark_and_idle_timeout_parse() {
         let p = write_temp(
             "flags",
             r#"[
-              {"endpoint":"https://a/x","target":"127.0.0.1:1","transparent":true,"fwmark":7},
-              {"endpoint":"https://b/y","target":"127.0.0.1:2"}
+              {"endpoint":"https://a/x","target":"127.0.0.1:1","transparent":true,"fwmark":7,"idle_timeout":90},
+              {"endpoint":"https://b/y","target":"127.0.0.1:2"},
+              {"endpoint":"https://c/z","target":"127.0.0.1:3","idle_timeout":0}
             ]"#,
         );
         let t = RuleTable::load(&p).unwrap();
         let a = t.match_target("a", "/x").unwrap();
         assert!(a.transparent);
         assert_eq!(a.fwmark, Some(7));
+        assert_eq!(a.idle_timeout, Some(Duration::from_secs(90)));
         let b = t.match_target("b", "/y").unwrap();
         assert!(!b.transparent);
         assert_eq!(b.fwmark, None);
+        // Default idle timeout is 35s.
+        assert_eq!(b.idle_timeout, Some(Duration::from_secs(35)));
+        // 0 disables the idle timeout.
+        assert_eq!(t.match_target("c", "/z").unwrap().idle_timeout, None);
         assert_eq!(t.privileged_count(), 1);
         let _ = std::fs::remove_file(&p);
     }
