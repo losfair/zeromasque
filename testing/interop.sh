@@ -50,9 +50,10 @@ echo "== starting servers =="
 "$ZM" serve --addr 127.0.0.1:4471 --template "$TMPL_ZM" --cert "$WORK/cert.pem" --key "$WORK/key.pem" \
   >"$WORK/zm-server.log" 2>&1 & PIDS+=($!)
 
-# ECH server
+# ECH server. Extract the base64 ECHConfigList with sed (portable to BSD/macOS,
+# which lack grep -P / \K).
 "$ZM" gen-ech-key --public-name public.example.com >"$WORK/ech.pem" 2>"$WORK/ech.err"
-ECH_B64=$(grep -oP 'ech="\K[^"]+' "$WORK/ech.err")
+ECH_B64=$(sed -n 's/.*ech="\([^"]*\)".*/\1/p' "$WORK/ech.err")
 "$ZM" serve --addr 127.0.0.1:4472 --template "$TMPL_ECH" --cert "$WORK/cert.pem" --key "$WORK/key.pem" \
   --ech-key "$WORK/ech.pem" >"$WORK/zm-ech.log" 2>&1 & PIDS+=($!)
 sleep 2
@@ -76,20 +77,26 @@ if "$ZM" client --template "$TMPL_ZM" --proxy-addr 127.0.0.1:4471 --target 127.0
 if "$ZM" client --template "$TMPL_ECH" --proxy-addr 127.0.0.1:4472 --target 127.0.0.1:5390 --insecure --ech-config "$ECH_B64" \
    --message four 2>/dev/null | grep -q 'echo:four'; then ok "zeromasque ECH client -> ECH server"; else bad "zeromasque ECH client -> ECH server"; fi
 
-# 5. SIGHUP cert hot reload: swap to cert-B and confirm the served fingerprint changes.
-fp() { "$ZM" client --template "$TMPL_ZM" --proxy-addr 127.0.0.1:4471 --target 127.0.0.1:5390 --insecure --message x 2>&1 \
-       | grep -oP 'sha256: \K[0-9a-f]+' || true; }
-FP1=$(fp)
-"$WORK/gencert" "$WORK/cert.pem" "$WORK/key.pem" 2002 cert-B
-ZM_PID=""
-for p in "${PIDS[@]}"; do
-  if tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -q '4471'; then ZM_PID=$p; break; fi
-done
-kill -HUP "$ZM_PID"; sleep 1
-FP2=$(fp)
-if [ -n "$FP1" ] && [ -n "$FP2" ] && [ "$FP1" != "$FP2" ]; then
-  ok "SIGHUP cert hot reload (served cert changed $FP1 -> $FP2)"
-else bad "SIGHUP cert hot reload (FP1=$FP1 FP2=$FP2)"; fi
+# 5. SIGHUP cert hot reload: swap to cert-B and confirm the served fingerprint
+#    changes. Reload uses signalfd and /proc, both Linux-only, and is disabled on
+#    other platforms, so skip the case there.
+if [ "$(uname -s)" = "Linux" ]; then
+  fp() { "$ZM" client --template "$TMPL_ZM" --proxy-addr 127.0.0.1:4471 --target 127.0.0.1:5390 --insecure --message x 2>&1 \
+         | sed -n 's/.*sha256: \([0-9a-f]*\).*/\1/p' || true; }
+  FP1=$(fp)
+  "$WORK/gencert" "$WORK/cert.pem" "$WORK/key.pem" 2002 cert-B
+  ZM_PID=""
+  for p in "${PIDS[@]}"; do
+    if tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -q '4471'; then ZM_PID=$p; break; fi
+  done
+  kill -HUP "$ZM_PID"; sleep 1
+  FP2=$(fp)
+  if [ -n "$FP1" ] && [ -n "$FP2" ] && [ "$FP1" != "$FP2" ]; then
+    ok "SIGHUP cert hot reload (served cert changed $FP1 -> $FP2)"
+  else bad "SIGHUP cert hot reload (FP1=$FP1 FP2=$FP2)"; fi
+else
+  echo "SKIP: SIGHUP cert hot reload (Linux-only feature; $(uname -s) ignores SIGHUP)"
+fi
 
 echo
 echo "== $pass passed, $fail failed =="
