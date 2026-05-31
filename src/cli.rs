@@ -89,8 +89,9 @@ impl ClientArgs {
 
 #[derive(Parser, Debug)]
 pub struct GenEchArgs {
-    /// Public name embedded in the ECHConfig. The server's TLS cert must cover
-    /// this name.
+    /// Public name (cleartext cover identity) embedded in the ECHConfig. The
+    /// server should be able to present a valid cert for it for the ECH-rejection
+    /// fallback; on ECH acceptance only the inner SNI is authenticated.
     #[arg(long, value_name = "NAME")]
     pub public_name: String,
 }

@@ -45,7 +45,8 @@ fn serve(args: ServeArgs) -> Result<()> {
             use base64ct::{Base64, Encoding};
             let list_b64 = Base64::encode_string(&set.config_list_bytes());
             eprintln!(
-                "ECH enabled: {} key(s); the TLS cert must cover each public name.",
+                "ECH enabled: {} key(s). On ECH acceptance only the inner SNI is \
+                 authenticated; the public name needs a valid cert for the rejection fallback.",
                 set.pairs.len()
             );
             eprintln!("Publish in the DNS HTTPS record: ech=\"{list_b64}\"");

@@ -76,10 +76,18 @@ Offer ECH from the client with the published ECHConfigList:
 zeromasque client ... --ech-config "AEX+DQBB...AAA="
 ```
 
-The server's certificate must cover the ECH public name. quiche exposes no
-per-connection `SSL` accessor, so the client installs the ECH config list via a
-BoringSSL context info-callback that fires at handshake start - see
-`src/quic.rs` (`install_client_ech`).
+Certificate coverage with ECH is subtle. When ECH is **accepted**, the
+handshake completes from the encrypted ClientHelloInner, so only the **inner**
+(real) SNI is authenticated — the certificate must cover the real proxy hostname
+the client puts in `:authority`, not the public name. The public name is the
+cleartext cover identity; it only needs a valid certificate for the ECH
+**rejection** fallback, where the client authenticates the outer name and retries
+with the server's fresh `retry_configs`. A cert covering both names handles both
+paths.
+
+quiche exposes no per-connection `SSL` accessor, so the client installs the ECH
+config list via a BoringSSL context info-callback that fires at handshake start -
+see `src/quic.rs` (`install_client_ech`).
 
 ## Testing
 

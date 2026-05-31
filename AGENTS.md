@@ -43,4 +43,6 @@
 ## Security & Configuration Tips
 
 - TLS expects PEM files; use local test certs (see `testing/gencert.go`).
-- The server's certificate must cover each ECH public name.
+- With ECH accepted, only the inner (real) SNI is authenticated, so the
+  certificate must cover the real proxy hostname clients send in `:authority`.
+  The public name only needs a valid certificate for the ECH-rejection fallback.
