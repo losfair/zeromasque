@@ -7,6 +7,7 @@ mod ech_test;
 mod endpoint;
 mod quic;
 mod reload;
+mod rules;
 mod server;
 mod varint;
 
@@ -34,9 +35,9 @@ fn main() -> Result<()> {
 }
 
 fn serve(args: ServeArgs) -> Result<()> {
-    let endpoint = Rc::new(Endpoint::parse(&args.endpoint)?);
-    let pinned_target = resolve_host_port(&args.target)
-        .with_context(|| format!("resolving pinned target {}", args.target))?;
+    let rule_table = rules::RuleTable::load(&args.rules)
+        .with_context(|| format!("loading rule table {}", args.rules.display()))?;
+    eprintln!("loaded {} forwarding rule(s)", rule_table.len());
 
     // Build the initial config eagerly so config errors fail fast (before the
     // runtime is up). ECH keys are loaded here too.
@@ -60,12 +61,14 @@ fn serve(args: ServeArgs) -> Result<()> {
     let config = quic::build_server_config(&args.cert, &args.key, ech.as_ref())?;
     let server_config = Rc::new(ServerConfig {
         config: std::cell::RefCell::new(config),
+        rules: std::cell::RefCell::new(rule_table),
     });
 
     let reload_paths = ReloadPaths {
         cert: args.cert.clone(),
         key: args.key.clone(),
         ech_key: args.ech_key.clone(),
+        rules: args.rules.clone(),
     };
 
     // Block SIGHUP before the runtime starts any work.
@@ -79,12 +82,10 @@ fn serve(args: ServeArgs) -> Result<()> {
             let socket = monoio::net::udp::UdpSocket::bind(args.addr)
                 .with_context(|| format!("binding QUIC listener {}", args.addr))?;
             eprintln!("zeromasque proxy listening on {} (udp)", args.addr);
-            eprintln!("endpoint: {}", endpoint.raw);
-            eprintln!("pinned target: all flows forward to {pinned_target}");
 
             spawn_reload(server_config.clone(), reload_paths, blocked)?;
 
-            let server = Server::new(socket, server_config, endpoint, pinned_target)?;
+            let server = Server::new(socket, server_config)?;
             server.run().await
         })
 }
@@ -143,15 +144,6 @@ fn load_ech_config(args: &ClientArgs) -> Result<Option<Vec<u8>>> {
         }
         None => Ok(None),
     }
-}
-
-/// Resolve a `host:port` string to a single socket address.
-fn resolve_host_port(s: &str) -> Result<std::net::SocketAddr> {
-    use std::net::ToSocketAddrs;
-    s.to_socket_addrs()
-        .with_context(|| format!("resolving {s}"))?
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("no addresses for {s}"))
 }
 
 fn init_logging() {

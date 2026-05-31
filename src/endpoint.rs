@@ -20,8 +20,6 @@ fn path_only(p: &str) -> &str {
 /// `:path` to send / accept.
 #[derive(Debug, Clone)]
 pub struct Endpoint {
-    /// The full original endpoint string.
-    pub raw: String,
     /// Authority (host[:port]) the client connects to / the server expects in
     /// the `:authority` pseudo-header.
     pub authority: String,
@@ -44,7 +42,6 @@ impl Endpoint {
             return Err(anyhow!("endpoint has no authority: {raw}"));
         }
         Ok(Self {
-            raw: raw.to_string(),
             authority: authority.to_string(),
             path: path.to_string(),
         })

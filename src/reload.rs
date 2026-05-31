@@ -12,12 +12,13 @@
 
 use std::path::PathBuf;
 
-/// Cert/key/ECH paths needed to rebuild the server config on reload.
+/// Paths needed to rebuild the server config (TLS/ECH) and rule table on reload.
 #[derive(Clone)]
 pub struct ReloadPaths {
     pub cert: PathBuf,
     pub key: PathBuf,
     pub ech_key: Option<PathBuf>,
+    pub rules: PathBuf,
 }
 
 #[cfg(target_os = "linux")]
@@ -32,6 +33,7 @@ mod imp {
     use super::ReloadPaths;
     use crate::ech::key::EchKeySet;
     use crate::quic;
+    use crate::rules::RuleTable;
     use crate::server::ServerConfig;
 
     /// Block `SIGHUP` on the calling thread (and, since this is the only thread,
@@ -86,17 +88,27 @@ mod imp {
                 continue;
             }
 
+            // Rebuild both the TLS/ECH config and the rule table before swapping,
+            // so a failure in either keeps the whole previous configuration.
             match rebuild(&paths) {
-                Ok(config) => {
+                Ok((config, rules)) => {
                     *server_config.config.borrow_mut() = config;
-                    log::info!("reloaded TLS/ECH configuration");
+                    *server_config.rules.borrow_mut() = rules;
+                    log::info!(
+                        "reloaded TLS/ECH configuration and {} rule(s)",
+                        rules_len(server_config.as_ref())
+                    );
                 }
                 Err(e) => log::error!("reload failed, keeping previous config: {e:?}"),
             }
         }
     }
 
-    fn rebuild(paths: &ReloadPaths) -> Result<quiche::Config> {
+    fn rules_len(server_config: &ServerConfig) -> usize {
+        server_config.rules.borrow().len()
+    }
+
+    fn rebuild(paths: &ReloadPaths) -> Result<(quiche::Config, RuleTable)> {
         let ech = match &paths.ech_key {
             Some(path) => Some(
                 EchKeySet::load(path)
@@ -104,7 +116,9 @@ mod imp {
             ),
             None => None,
         };
-        quic::build_server_config(&paths.cert, &paths.key, ech.as_ref())
+        let config = quic::build_server_config(&paths.cert, &paths.key, ech.as_ref())?;
+        let rules = RuleTable::load(&paths.rules)?;
+        Ok((config, rules))
     }
 }
 

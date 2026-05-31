@@ -19,6 +19,8 @@ libc = "0.2"
 rand = "0.8"
 futures = "0.3"
 log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 # quiche pins boring to ^4.3, so we use the matching boring 4.x so the ECH
 # `SslContextBuilder` we hand to quiche shares one BoringSSL ABI.
 boring = "4"

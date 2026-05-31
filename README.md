@@ -25,34 +25,41 @@ few minutes.
 
 ## Model
 
-The forwarding **target is pinned on the server** — the proxy always forwards to
-one configured `host:port`, and clients cannot choose a destination. The two ends
-agree on a fixed **endpoint** URI (no `{target_host}`/`{target_port}` variables).
-The server matches the request on the **path component only**, ignoring the query
-string, so generic MASQUE clients that carry `target_host`/`target_port` in the
-query still interoperate (the server ignores those and uses its pinned target).
+The forwarding **target is pinned on the server** — clients cannot choose a
+destination. The server loads a **rule table** mapping endpoints to targets, and
+a CONNECT-UDP request is matched on its `:authority` + path (the query string is
+ignored, so generic MASQUE clients that carry `target_host`/`target_port` in the
+query still interoperate; the server ignores those and uses the rule's target).
 
 The **client is a local UDP proxy**: it binds a UDP socket and tunnels every
-datagram received there to the pinned target, opening one CONNECT-UDP flow per
-local source address and relaying replies back.
+datagram received there through the proxy, opening one CONNECT-UDP flow per local
+source address and relaying replies back.
 
 ## Usage
 
-Run the proxy, pinned to a target (e.g. a DNS resolver):
+Write a rule table (`rules.json`) mapping endpoints to pinned targets:
+
+```json
+[
+  {"endpoint": "https://dns.example:4433/connect", "target": "192.0.2.10:53"},
+  {"endpoint": "https://ntp.example:4433/connect", "target": "192.0.2.20:123"}
+]
+```
+
+Run the proxy:
 
 ```
 zeromasque serve \
   --addr 0.0.0.0:4433 \
-  --endpoint 'https://proxy.example:4433/connect' \
-  --target 192.0.2.10:53 \
+  --rules rules.json \
   --cert cert.pem --key key.pem
 ```
 
-Run the client as a local UDP proxy on `127.0.0.1:5353`:
+Run the client as a local UDP proxy on `127.0.0.1:5353`, pointed at one endpoint:
 
 ```
 zeromasque client \
-  --endpoint 'https://proxy.example:4433/connect' \
+  --endpoint 'https://dns.example:4433/connect' \
   --listen 127.0.0.1:5353
 ```
 
@@ -66,10 +73,11 @@ dig @127.0.0.1 -p 5353 example.com
 the endpoint host as SNI / `:authority` (useful when the host resolves to an
 address the proxy isn't bound to, e.g. `localhost` → `::1`).
 
-### Certificate hot reload (Linux only)
+### Hot reload (Linux only)
 
-Send `SIGHUP` to rebuild the TLS/ECH configuration from the cert, key and ECH
-files. New connections pick up the rotated material; existing connections keep
+Send `SIGHUP` to rebuild the TLS/ECH configuration *and* the rule table from
+their files. New connections pick up rotated certificates; new requests pick up
+the new rule table; existing connections keep
 the configuration they handshook with. A failed reload (e.g. a half-written
 file) is logged and the previous configuration is retained.
 
@@ -118,17 +126,21 @@ see `src/quic.rs` (`install_client_ech`).
 ### Access control
 
 By default the proxy performs **no client authentication**: any peer that can
-reach it and send a CONNECT-UDP request whose path matches the configured
-endpoint is granted a tunnel. (The client still authenticates the *server* via
-TLS unless `--insecure`.)
+reach it and send a CONNECT-UDP request matching a rule's authority + path is
+granted a tunnel. (The client still authenticates the *server* via TLS unless
+`--insecure`.)
 
-A secret can be embedded in the endpoint **path** as a lightweight shared-secret
-gate. The server matches on the path component (the query string is ignored), so
-put the secret in a path segment — not the query:
+A secret can be embedded in a rule's endpoint **path** as a lightweight
+shared-secret gate. The server matches on the path component (the query string is
+ignored), so put the secret in a path segment — not the query:
+
+```json
+// rules.json
+[{"endpoint": "https://proxy:4433/connect/s3cret-9f2c", "target": "192.0.2.10:53"}]
+```
 
 ```
-# server and client both configured with the same secret path:
-zeromasque serve  --endpoint 'https://proxy:4433/connect/s3cret-9f2c' --target ... ...
+# client uses the same secret path:
 zeromasque client --endpoint 'https://proxy:4433/connect/s3cret-9f2c' --listen ...
 ```
 
@@ -174,11 +186,12 @@ certificate changes.
 
 ## Layout
 
-- `src/server.rs` - the io_uring CONNECT-UDP proxy event loop (target pinned).
+- `src/server.rs` - the io_uring CONNECT-UDP proxy event loop (rule-pinned).
 - `src/client.rs` - the local UDP→CONNECT-UDP proxy client.
+- `src/rules.rs` - the JSON endpoint→target rule table.
 - `src/quic.rs` - quiche transport + BoringSSL configuration, ECH install hooks.
-- `src/reload.rs` - `signalfd`-driven SIGHUP cert/ECH hot reload (Linux; a no-op
-  stub elsewhere).
+- `src/reload.rs` - `signalfd`-driven SIGHUP cert/ECH/rule hot reload (Linux; a
+  no-op stub elsewhere).
 - `src/endpoint.rs`, `src/dgram.rs`, `src/varint.rs` - endpoint matching and
   HTTP/3 datagram / QUIC varint framing.
 - `src/ech/` - ECH key material: wire format, PEM key files, keygen (ported from

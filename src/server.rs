@@ -17,8 +17,8 @@ use monoio::net::udp::UdpSocket;
 use quiche::h3::NameValue;
 
 use crate::dgram;
-use crate::endpoint::Endpoint;
 use crate::quic;
+use crate::rules::RuleTable;
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
 const RECV_BUF: usize = 65535;
@@ -51,11 +51,13 @@ struct Client {
     peer: SocketAddr,
 }
 
-/// Hot-reloadable TLS/QUIC configuration. The reload task swaps the inner
-/// config so new connections pick up rotated certificates and ECH keys; live
-/// connections keep the config captured at accept time.
+/// Hot-reloadable server configuration. The reload task swaps the inner config
+/// (rotated certificates / ECH keys) and the endpoint→target rule table; new
+/// connections and requests pick up the new values, while live connections keep
+/// the TLS config captured at accept time.
 pub struct ServerConfig {
     pub config: RefCell<quiche::Config>,
+    pub rules: RefCell<RuleTable>,
 }
 
 pub struct Server {
@@ -63,9 +65,6 @@ pub struct Server {
     local_addr: SocketAddr,
     server_config: Rc<ServerConfig>,
     h3_config: quiche::h3::Config,
-    endpoint: Rc<Endpoint>,
-    /// Every flow forwards here; the target is pinned server-side.
-    pinned_target: SocketAddr,
     /// Active connections keyed by the server-chosen SCID.
     clients: HashMap<ConnId, Client>,
     /// Maps a client's original (handshake) DCID to our SCID, so early Initial
@@ -77,12 +76,7 @@ pub struct Server {
 }
 
 impl Server {
-    pub fn new(
-        socket: UdpSocket,
-        server_config: Rc<ServerConfig>,
-        endpoint: Rc<Endpoint>,
-        pinned_target: SocketAddr,
-    ) -> Result<Self> {
+    pub fn new(socket: UdpSocket, server_config: Rc<ServerConfig>) -> Result<Self> {
         let local_addr = socket.local_addr().context("reading local UDP address")?;
         let h3_config = quic::build_h3_config()?;
         let (to_client_tx, to_client_rx) = mpsc::channel(CHANNEL_CAP);
@@ -91,8 +85,6 @@ impl Server {
             local_addr,
             server_config,
             h3_config,
-            endpoint,
-            pinned_target,
             clients: HashMap::new(),
             routes: HashMap::new(),
             to_client_tx,
@@ -204,8 +196,7 @@ impl Server {
             client,
             &conn_key,
             &self.h3_config,
-            &self.endpoint,
-            self.pinned_target,
+            &self.server_config,
             &self.to_client_tx,
         );
     }
@@ -311,8 +302,7 @@ fn process_client(
     client: &mut Client,
     conn_id: &ConnId,
     h3_config: &quiche::h3::Config,
-    endpoint: &Endpoint,
-    pinned_target: SocketAddr,
+    server_config: &ServerConfig,
     to_client_tx: &mpsc::Sender<ToClient>,
 ) {
     if !(client.conn.is_established() || client.conn.is_in_early_data()) {
@@ -339,8 +329,7 @@ fn process_client(
                     &mut client.flows,
                     stream_id,
                     &list,
-                    endpoint,
-                    pinned_target,
+                    server_config,
                     conn_id,
                     to_client_tx,
                 );
@@ -379,8 +368,7 @@ fn handle_connect_request(
     flows: &mut HashMap<u64, Flow>,
     stream_id: u64,
     headers: &[quiche::h3::Header],
-    endpoint: &Endpoint,
-    target: SocketAddr,
+    server_config: &ServerConfig,
     conn_id: &ConnId,
     to_client_tx: &mpsc::Sender<ToClient>,
 ) {
@@ -393,17 +381,25 @@ fn handle_connect_request(
         }
     };
 
-    // The path must match the configured endpoint exactly. The forwarding
-    // target is pinned, so the client never selects a destination.
-    if !endpoint.matches(&req.path) {
-        log::debug!(
-            "path {:?} did not match endpoint {:?}",
-            req.path,
-            endpoint.path
-        );
-        respond_status(conn, http3, stream_id, 404);
-        return;
-    }
+    // Look up the pinned target for this request's authority + path in the rule
+    // table. The borrow is released immediately (the target is `Copy`). The
+    // client never selects a destination.
+    let target = match server_config
+        .rules
+        .borrow()
+        .match_target(&req.authority, &req.path)
+    {
+        Some(target) => target,
+        None => {
+            log::debug!(
+                "no rule for authority {:?} path {:?}",
+                req.authority,
+                req.path
+            );
+            respond_status(conn, http3, stream_id, 404);
+            return;
+        }
+    };
 
     let target_sock = match bind_target(target) {
         Ok(s) => s,
@@ -526,6 +522,7 @@ async fn target_task(
 
 /// Parsed pseudo-headers of a CONNECT-UDP request.
 struct ConnectRequest {
+    authority: String,
     path: String,
 }
 
@@ -534,11 +531,13 @@ impl ConnectRequest {
     fn parse(headers: &[quiche::h3::Header]) -> std::result::Result<Self, u16> {
         let mut method = None;
         let mut protocol = None;
+        let mut authority = None;
         let mut path = None;
         for h in headers {
             match h.name() {
                 b":method" => method = Some(h.value().to_vec()),
                 b":protocol" => protocol = Some(h.value().to_vec()),
+                b":authority" => authority = Some(h.value().to_vec()),
                 b":path" => path = Some(h.value().to_vec()),
                 _ => {}
             }
@@ -549,9 +548,11 @@ impl ConnectRequest {
         if protocol.as_deref() != Some(b"connect-udp") {
             return Err(501);
         }
+        let authority = authority.ok_or(400u16)?;
+        let authority = String::from_utf8(authority).map_err(|_| 400u16)?;
         let path = path.ok_or(400u16)?;
         let path = String::from_utf8(path).map_err(|_| 400u16)?;
-        Ok(Self { path })
+        Ok(Self { authority, path })
     }
 }
 

@@ -46,23 +46,29 @@ rm -f "$WORK/mgclient/go.mod.template"
 ( cd "$WORK/mgclient" && go mod tidy >/dev/null 2>&1 && go build -o "$WORK/mg-client" . )
 
 "$WORK/gencert" "$WORK/cert.pem" "$WORK/key.pem" 1001 cert-A
-ECHO=127.0.0.1:5390
+ECHO=127.0.0.1:5390   # primary echo target (prefix "echo:")
+ECHO2=127.0.0.1:5391  # alternate echo target (prefix "echo2:"), for rule reload
+
+# Rule tables (endpoint -> pinned target).
+echo "[{\"endpoint\":\"https://localhost:4471/connect\",\"target\":\"$ECHO\"}]" > "$WORK/rules.json"
+echo "[{\"endpoint\":\"https://localhost:4472/connect\",\"target\":\"$ECHO\"}]" > "$WORK/rules-ech.json"
 
 echo "== starting servers =="
 "$WORK/udpecho" "$ECHO" & PIDS+=($!)
+"$WORK/udpecho" "$ECHO2" "echo2:" & PIDS+=($!)
 # masque-go proxy: variable template, client selects the target.
 "$WORK/mg-proxy" -t 'https://localhost:4470/masque?h={target_host}&p={target_port}' \
   -b 127.0.0.1:4470 -c "$WORK/cert.pem" -k "$WORK/key.pem" & PIDS+=($!)
-# zeromasque server: fixed endpoint, target pinned to the echo server.
-"$ZM" serve --addr 127.0.0.1:4471 --endpoint 'https://localhost:4471/connect' \
-  --cert "$WORK/cert.pem" --key "$WORK/key.pem" --target "$ECHO" \
+# zeromasque server: rule table pins the target.
+"$ZM" serve --addr 127.0.0.1:4471 --rules "$WORK/rules.json" \
+  --cert "$WORK/cert.pem" --key "$WORK/key.pem" \
   >"$WORK/zm-server.log" 2>&1 & PIDS+=($!)
 
-# ECH server (also pinned). Extract the base64 ECHConfigList with sed (portable).
+# ECH server (also rule-pinned). Extract the base64 ECHConfigList with sed (portable).
 "$ZM" gen-ech-key --public-name public.example.com >"$WORK/ech.pem" 2>"$WORK/ech.err"
 ECH_B64=$(sed -n 's/.*ech="\([^"]*\)".*/\1/p' "$WORK/ech.err")
-"$ZM" serve --addr 127.0.0.1:4472 --endpoint 'https://localhost:4472/connect' \
-  --cert "$WORK/cert.pem" --key "$WORK/key.pem" --target "$ECHO" --ech-key "$WORK/ech.pem" \
+"$ZM" serve --addr 127.0.0.1:4472 --rules "$WORK/rules-ech.json" \
+  --cert "$WORK/cert.pem" --key "$WORK/key.pem" --ech-key "$WORK/ech.pem" \
   >"$WORK/zm-ech.log" 2>&1 & PIDS+=($!)
 sleep 2
 
@@ -95,10 +101,17 @@ if zm_send 127.0.0.1:6003 "https://localhost:4471/connect" 127.0.0.1:4471 three 
 if zm_send 127.0.0.1:6004 "https://localhost:4472/connect" 127.0.0.1:4472 four --ech-config "$ECH_B64" \
    | grep -q 'echo:four'; then ok "zeromasque ECH client -> ECH server"; else bad "zeromasque ECH client -> ECH server"; fi
 
-# 5. SIGHUP cert hot reload: swap to cert-B and confirm the served fingerprint
-#    changes. Reload uses signalfd and /proc, both Linux-only.
+# 5. SIGHUP hot reload (Linux only: reload uses signalfd and /proc). Covers both
+#    the TLS certificate and the rule table.
 if [ "$(uname -s)" = "Linux" ]; then
-  # Fingerprint of the cert served to a fresh client proxy connection.
+  # Identify the 4471 server process (cmdline contains both `serve` and the addr).
+  ZM_PID=""
+  for p in "${PIDS[@]}"; do
+    cmd=$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null || true)
+    case "$cmd" in *serve*127.0.0.1:4471*) ZM_PID=$p; break ;; esac
+  done
+
+  # 5a. Cert reload: swap to cert-B, confirm the served fingerprint changes.
   fp() {
     "$ZM" client --listen "$1" --endpoint 'https://localhost:4471/connect' \
       --proxy-addr 127.0.0.1:4471 --insecure >/dev/null 2>"$WORK/fp.log" &
@@ -110,17 +123,20 @@ if [ "$(uname -s)" = "Linux" ]; then
   }
   FP1=$(fp 127.0.0.1:6005)
   "$WORK/gencert" "$WORK/cert.pem" "$WORK/key.pem" 2002 cert-B
-  ZM_PID=""
-  for p in "${PIDS[@]}"; do
-    if tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -q '4471'; then ZM_PID=$p; break; fi
-  done
   kill -HUP "$ZM_PID"; sleep 1
   FP2=$(fp 127.0.0.1:6006)
   if [ -n "$FP1" ] && [ -n "$FP2" ] && [ "$FP1" != "$FP2" ]; then
     ok "SIGHUP cert hot reload (served cert changed $FP1 -> $FP2)"
   else bad "SIGHUP cert hot reload (FP1=$FP1 FP2=$FP2)"; fi
+
+  # 5b. Rule reload: repoint the target from ECHO (echo:) to ECHO2 (echo2:) and
+  #     confirm tunnelled traffic now reaches the new target.
+  echo "[{\"endpoint\":\"https://localhost:4471/connect\",\"target\":\"$ECHO2\"}]" > "$WORK/rules.json"
+  kill -HUP "$ZM_PID"; sleep 1
+  if zm_send 127.0.0.1:6007 "https://localhost:4471/connect" 127.0.0.1:4471 reloaded \
+     | grep -q 'echo2:reloaded'; then ok "SIGHUP rule hot reload (target repointed)"; else bad "SIGHUP rule hot reload"; fi
 else
-  echo "SKIP: SIGHUP cert hot reload (Linux-only feature; $(uname -s) ignores SIGHUP)"
+  echo "SKIP: SIGHUP hot reload (Linux-only feature; $(uname -s) ignores SIGHUP)"
 fi
 
 echo

@@ -3,7 +3,8 @@
 ## Project Structure & Module Organization
 
 - `src/` contains the proxy server, client, quiche/BoringSSL configuration, the
-  SIGHUP reload task, and the HTTP/3 datagram + endpoint matching.
+  SIGHUP reload task, the JSON endpoint→target rule table (`rules.rs`), and the
+  HTTP/3 datagram + endpoint matching.
 - `src/ech/` holds ECH key material (wire format, PEM key files, keygen).
 - `testing/` contains the masque-go interop harness and its Go helpers.
 

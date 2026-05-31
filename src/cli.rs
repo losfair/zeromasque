@@ -26,11 +26,12 @@ pub struct ServeArgs {
     #[arg(long, default_value = "0.0.0.0:4433")]
     pub addr: SocketAddr,
 
-    /// Proxy endpoint URI the client requests, e.g.
-    /// `https://localhost:4433/connect`. A fixed path (no target variables); a
-    /// secret may be embedded in the path/query as an admission gate.
-    #[arg(long)]
-    pub endpoint: String,
+    /// JSON rule table mapping endpoints to pinned targets, e.g.
+    /// `[{"endpoint":"https://a.example.com/masque","target":"127.0.0.1:1234"}]`.
+    /// Requests are matched on `:authority` + path (query ignored); the matching
+    /// rule's target is the pinned destination. Hot-reloadable via SIGHUP.
+    #[arg(long, value_name = "FILE")]
+    pub rules: PathBuf,
 
     /// TLS certificate chain (PEM).
     #[arg(long)]
@@ -43,11 +44,6 @@ pub struct ServeArgs {
     /// Path to an ECH key file or directory (enables server-side ECH).
     #[arg(long, value_name = "PATH")]
     pub ech_key: Option<PathBuf>,
-
-    /// Pinned forwarding target `host:port`. Every CONNECT-UDP flow is forwarded
-    /// here; the client cannot select a destination.
-    #[arg(long, value_name = "HOST:PORT")]
-    pub target: String,
 }
 
 #[derive(Parser, Debug)]
