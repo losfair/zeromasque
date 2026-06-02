@@ -3,11 +3,15 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ["*"]
   pull_request:
     branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
 
 jobs:
   build-test:
@@ -75,3 +79,93 @@ jobs:
         env:
           MASQUE_GO: ${{ github.workspace }}/masque-go
         run: ./testing/interop.sh
+
+  release-builds:
+    name: release build (${{ matrix.target_label }})
+    if: github.ref_type == 'tag'
+    needs: [build-test, interop]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target_label: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            rust_target: x86_64-unknown-linux-gnu
+            zig_target: x86_64-unknown-linux-gnu.2.31
+            use_zigbuild: true
+          - target_label: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            rust_target: aarch64-unknown-linux-gnu
+            zig_target: aarch64-unknown-linux-gnu.2.31
+            use_zigbuild: true
+          - target_label: aarch64-apple-darwin
+            os: macos-14
+            rust_target: aarch64-apple-darwin
+            use_zigbuild: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build prerequisites (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y cmake
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Zig
+        if: matrix.use_zigbuild
+        uses: mlugg/setup-zig@v2
+
+      - name: Install cargo-zigbuild
+        if: matrix.use_zigbuild
+        run: cargo install cargo-zigbuild --locked
+
+      - name: Build Linux release binary
+        if: matrix.use_zigbuild
+        run: cargo zigbuild --release --target ${{ matrix.zig_target }}
+
+      - name: Build macOS release binary
+        if: matrix.use_zigbuild == false
+        run: cargo build --release --target ${{ matrix.rust_target }}
+
+      - name: Package release binary
+        run: |
+          mkdir -p dist package
+          bin_path="$(find target -type f -path '*/release/zeromasque' -print -quit)"
+          test -n "$bin_path"
+          cp "$bin_path" package/
+          tar -czf dist/zeromasque-${{ matrix.target_label }}.tar.gz -C package zeromasque
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zeromasque-${{ matrix.target_label }}
+          path: dist/*.tar.gz
+
+  publish-release:
+    name: publish release
+    if: github.ref_type == 'tag'
+    needs: release-builds
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.tar.gz
