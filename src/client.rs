@@ -414,10 +414,10 @@ async fn route_tunnel_datagrams(
                     continue;
                 }
                 let (flow_id, payload) = (p.flow_id, p.payload.to_vec());
-                if let Some(src) = flows.get(&flow_id) {
-                    if let Err(e) = io::send_udp(lsock, payload, *src).await {
-                        log::debug!("send to local {src} failed: {e}");
-                    }
+                if let Some(src) = flows.get(&flow_id)
+                    && let Err(e) = io::send_udp(lsock, payload, *src).await
+                {
+                    log::debug!("send to local {src} failed: {e}");
                 }
             }
             Err(quiche::Error::Done) => break,

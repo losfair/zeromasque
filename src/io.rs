@@ -172,7 +172,7 @@ impl SendBatch {
 
         let compatible = self.to == Some(to)
             && packet.len() <= self.segment_size
-            && (packet.len() == self.segment_size || self.packets.len() + 1 <= SEND_BATCH);
+            && (packet.len() == self.segment_size || self.packets.len() < SEND_BATCH);
 
         if compatible {
             self.packets.push(packet);
