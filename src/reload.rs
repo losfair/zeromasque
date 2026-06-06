@@ -116,8 +116,13 @@ mod imp {
             ),
             None => None,
         };
-        let config = quic::build_server_config(&paths.cert, &paths.key, ech.as_ref())?;
         let rules = RuleTable::load(&paths.rules)?;
+        let config = quic::build_server_config(
+            &paths.cert,
+            &paths.key,
+            ech.as_ref(),
+            rules.allowed_sni_hosts(),
+        )?;
         Ok((config, rules))
     }
 }

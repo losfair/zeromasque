@@ -67,7 +67,12 @@ fn serve(args: ServeArgs) -> Result<()> {
         None => None,
     };
 
-    let config = quic::build_server_config(&args.cert, &args.key, ech.as_ref())?;
+    let config = quic::build_server_config(
+        &args.cert,
+        &args.key,
+        ech.as_ref(),
+        rule_table.allowed_sni_hosts(),
+    )?;
     let server_config = Rc::new(ServerConfig {
         config: std::cell::RefCell::new(config),
         rules: std::cell::RefCell::new(rule_table),

@@ -71,19 +71,24 @@ impl Side {
             Side::Done(s) => s.get_mut(),
         }
     }
-    fn pump(self) -> (Side, Option<bool>) {
+    fn try_pump(self) -> std::result::Result<(Side, Option<bool>), HandshakeError<Mem>> {
         let mid = match self {
             Side::Mid(m) => m,
-            other => return (other, None),
+            other => return Ok((other, None)),
         };
         match mid.handshake() {
             Ok(s) => {
                 let ech = s.ssl().ech_accepted();
-                (Side::Done(s), Some(ech))
+                Ok((Side::Done(s), Some(ech)))
             }
-            Err(HandshakeError::WouldBlock(m)) => (Side::Mid(m), None),
-            Err(e) => panic!("handshake error: {e}"),
+            Err(HandshakeError::WouldBlock(m)) => Ok((Side::Mid(m), None)),
+            Err(e) => Err(e),
         }
+    }
+
+    fn pump(self) -> (Side, Option<bool>) {
+        self.try_pump()
+            .unwrap_or_else(|e| panic!("handshake error: {e}"))
     }
 }
 
@@ -141,9 +146,7 @@ fn self_signed() -> (
     (b.build(), pkey)
 }
 
-#[test]
-fn ech_accepted_end_to_end() {
-    // Fresh HPKE keypair + matching ECHConfig (our production keygen + codec).
+fn ech_config_list_and_key_set() -> (Vec<u8>, EchKeySet) {
     let (public_key, private_key) = generate_hpke_x25519_keypair().unwrap();
     let config = EchConfig {
         config_id: 0x2a,
@@ -163,27 +166,45 @@ fn ech_accepted_end_to_end() {
             config,
         }],
     };
+    (config_list, key_set)
+}
 
+fn server_context(key_set: &EchKeySet, allowed_sni_hosts: Vec<String>) -> boring::ssl::SslContext {
     let (cert, key) = self_signed();
 
-    // Server context with ECH keys installed via the production helper.
     let mut sb = SslContextBuilder::new(SslMethod::tls()).unwrap();
     sb.set_min_proto_version(Some(SslVersion::TLS1_3)).unwrap();
     sb.set_max_proto_version(Some(SslVersion::TLS1_3)).unwrap();
     sb.set_certificate(&cert).unwrap();
     sb.set_private_key(&key).unwrap();
-    quic::install_ech_keys(&mut sb, &key_set).unwrap();
-    let server_ctx = sb.build();
+    quic::install_ech_keys(&mut sb, key_set).unwrap();
+    quic::install_sni_guard(&mut sb, allowed_sni_hosts);
+    sb.build()
+}
 
-    // Client context offering ECH via the production injection helper.
+fn client_ssl(config_list: Vec<u8>, server_name: &str) -> Ssl {
     let mut cb = SslConnector::builder(SslMethod::tls()).unwrap();
     cb.set_verify(SslVerifyMode::NONE);
     quic::install_client_ech(&mut cb, config_list);
-    let client_conf = cb.build().configure().unwrap();
+    cb.build()
+        .configure()
+        .unwrap()
+        .into_ssl(server_name)
+        .unwrap()
+}
+
+#[test]
+fn ech_accepted_end_to_end() {
+    // Fresh HPKE keypair + matching ECHConfig (our production keygen + codec).
+    let (config_list, key_set) = ech_config_list_and_key_set();
+
+    // Server context with ECH keys and SNI guard installed via production
+    // helpers. The guard must see the protected inner SNI, not the public name.
+    let server_ctx = server_context(&key_set, vec!["secret.internal".into()]);
 
     let server_ssl = Ssl::new(&server_ctx).unwrap();
     let mut srv = Side::Mid(SslStreamBuilder::new(server_ssl, Mem::new()).setup_accept());
-    let client_ssl = client_conf.into_ssl("secret.internal").unwrap();
+    let client_ssl = client_ssl(config_list, "secret.internal");
     let mut cli = Side::Mid(SslStreamBuilder::new(client_ssl, Mem::new()).setup_connect());
 
     let (mut client_ech, mut server_ech) = (None, None);
@@ -217,4 +238,30 @@ fn ech_accepted_end_to_end() {
     } else {
         panic!("server handshake did not complete");
     }
+}
+
+#[test]
+fn unmatched_inner_sni_is_rejected_during_tls_handshake() {
+    let (config_list, key_set) = ech_config_list_and_key_set();
+    let server_ctx = server_context(&key_set, vec!["other.internal".into()]);
+
+    let server_ssl = Ssl::new(&server_ctx).unwrap();
+    let mut srv = Side::Mid(SslStreamBuilder::new(server_ssl, Mem::new()).setup_accept());
+    let client_ssl = client_ssl(config_list, "secret.internal");
+    let mut cli = Side::Mid(SslStreamBuilder::new(client_ssl, Mem::new()).setup_connect());
+
+    for _ in 0..30 {
+        let (c, _) = cli.pump();
+        cli = c;
+        move_bytes(&mut cli, &mut srv);
+
+        match srv.try_pump() {
+            Ok((s, _)) => srv = s,
+            Err(HandshakeError::Failure(_)) => return,
+            Err(e) => panic!("unexpected handshake error: {e}"),
+        }
+        move_bytes(&mut srv, &mut cli);
+    }
+
+    panic!("server handshake did not reject unmatched inner SNI");
 }

@@ -22,6 +22,18 @@ use serde::Deserialize;
 
 use crate::endpoint::Endpoint;
 
+fn host_of_authority(authority: &str) -> &str {
+    if let Some(rest) = authority.strip_prefix('[')
+        && let Some((host, _)) = rest.split_once(']')
+    {
+        return host;
+    }
+    authority
+        .rsplit_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or(authority)
+}
+
 /// Default per-flow idle timeout (seconds) when a rule doesn't specify one.
 fn default_idle_secs() -> u64 {
     35
@@ -115,6 +127,19 @@ impl RuleTable {
         self.rules.len()
     }
 
+    /// Unique hostname values allowed in TLS SNI, derived from rule endpoint
+    /// authorities. Ports are stripped because SNI carries only a host name.
+    pub fn allowed_sni_hosts(&self) -> Vec<String> {
+        let mut hosts = Vec::new();
+        for rule in &self.rules {
+            let host = host_of_authority(&rule.endpoint.authority).to_ascii_lowercase();
+            if !hosts.contains(&host) {
+                hosts.push(host);
+            }
+        }
+        hosts
+    }
+
     /// Number of rules needing `CAP_NET_ADMIN` (transparent forwarding or fwmark).
     pub fn privileged_count(&self) -> usize {
         self.rules
@@ -174,6 +199,10 @@ mod tests {
             target(&t, "b.example.com", "/connect"),
             "127.0.0.1:5678".parse().ok()
         );
+        assert_eq!(
+            t.allowed_sni_hosts(),
+            vec!["a.example.com", "b.example.com"]
+        );
         // Right path, wrong host -> no match.
         assert_eq!(target(&t, "b.example.com", "/masque"), None);
         // Right host, wrong path -> no match.
@@ -204,6 +233,21 @@ mod tests {
         // 0 disables the idle timeout.
         assert_eq!(t.match_target("c", "/z").unwrap().idle_timeout, None);
         assert_eq!(t.privileged_count(), 1);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn allowed_sni_hosts_strip_ports_and_brackets() {
+        let p = write_temp(
+            "sni",
+            r#"[
+              {"endpoint":"https://Example.com:4433/x","target":"127.0.0.1:1"},
+              {"endpoint":"https://example.com:8443/y","target":"127.0.0.1:2"},
+              {"endpoint":"https://[::1]:443/z","target":"127.0.0.1:3"}
+            ]"#,
+        );
+        let t = RuleTable::load(&p).unwrap();
+        assert_eq!(t.allowed_sni_hosts(), vec!["example.com", "::1"]);
         let _ = std::fs::remove_file(&p);
     }
 

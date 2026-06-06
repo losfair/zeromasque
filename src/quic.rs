@@ -9,8 +9,8 @@ use std::path::Path;
 
 use anyhow::{Context, Result, anyhow};
 use boring::ssl::{
-    SslContextBuilder, SslEchKeys, SslInfoCallbackMode, SslMethod, SslRef, SslVerifyMode,
-    SslVersion,
+    NameType, SelectCertError, SslContextBuilder, SslEchKeys, SslInfoCallbackMode, SslMethod,
+    SslRef, SslVerifyMode, SslVersion,
 };
 use foreign_types_shared::ForeignTypeRef;
 
@@ -177,12 +177,30 @@ pub(crate) fn install_ech_keys(builder: &mut SslContextBuilder, ech: &EchKeySet)
     Ok(())
 }
 
+/// Reject handshakes whose ClientHello SNI is missing or not one of the
+/// configured proxy endpoint hosts. With ECH accepted, BoringSSL exposes the
+/// protected inner SNI here; without ECH this checks the ordinary SNI.
+pub(crate) fn install_sni_guard(builder: &mut SslContextBuilder, allowed_hosts: Vec<String>) {
+    builder.set_select_certificate_callback(move |client_hello| {
+        let Some(sni) = client_hello.servername(NameType::HOST_NAME) else {
+            log::debug!("rejecting TLS ClientHello without SNI");
+            return Err(SelectCertError::ERROR);
+        };
+        if allowed_hosts.iter().any(|h| h.eq_ignore_ascii_case(sni)) {
+            return Ok(());
+        }
+        log::debug!("rejecting TLS ClientHello with unmatched SNI {sni:?}");
+        Err(SelectCertError::ERROR)
+    });
+}
+
 /// Build the server-side quiche config from a cert/key PEM pair, optionally
 /// terminating ECH with the supplied key set.
 pub fn build_server_config(
     cert_path: &Path,
     key_path: &Path,
     ech: Option<&EchKeySet>,
+    allowed_sni_hosts: Vec<String>,
 ) -> Result<quiche::Config> {
     let mut builder =
         SslContextBuilder::new(SslMethod::tls()).context("creating BoringSSL server context")?;
@@ -208,6 +226,7 @@ pub fn build_server_config(
     if let Some(ech) = ech {
         install_ech_keys(&mut builder, ech)?;
     }
+    install_sni_guard(&mut builder, allowed_sni_hosts);
 
     let mut config = quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, builder)
         .map_err(|e| anyhow!("quiche server config: {e}"))?;
