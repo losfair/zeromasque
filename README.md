@@ -23,6 +23,14 @@ cargo build --release
 The first build compiles BoringSSL from source (via `boring-sys`), so it takes a
 few minutes.
 
+## BBRv2 DATAGRAM regression
+
+This checkout vendors a quiche 0.29.1 fix for ProbeUp window growth when a
+complete DATAGRAM cannot fit in the last bytes of the congestion window.
+Run `python3 testing/repro_bbr_datagram.py` for a single-host before/after
+reproduction. See [the reproducer and results](testing/bbr-datagram-repro.md)
+and [the vendored patch notes](vendor/README.md).
+
 ## Model
 
 The forwarding **target is pinned on the server** — clients cannot choose a

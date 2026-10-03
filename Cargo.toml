@@ -3,6 +3,11 @@ name = "zeromasque"
 version = "0.1.0"
 edition = "2024"
 
+[workspace]
+members = ["vendor/quiche-0.29.1"]
+default-members = ["."]
+resolver = "3"
+
 [profile.release]
 panic = "abort"
 
@@ -36,6 +41,7 @@ monoio = { version = "0.2", default-features = false, features = ["async-cancel"
 quiche = { version = "0.29", default-features = false, features = ["boringssl-boring-crate"] }
 
 [patch.crates-io]
+quiche = { path = "vendor/quiche-0.29.1" }
 monoio = { git = "https://github.com/bytedance/monoio", rev = "212fde187f3d41f65ecd35b9cac80f7e246bb58e" }
 
 [dev-dependencies]
